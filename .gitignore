@@ -1,0 +1,6 @@
+data/
+*.root
+*.log
+log_*.txt
+__pycache__/
+*.pyc
