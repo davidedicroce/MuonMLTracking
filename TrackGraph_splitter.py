@@ -7,7 +7,7 @@ python TrackGraph_splitter.py \
   --data-glob "./data/track_graphs_pu0_part*.h5" \
   --val-fraction 0.1 \
   --seed 12345 \
-  --out split_track_graphs_pu0_seed12345.npz
+  --out data/split_track_graphs_pu0_seed12345.npz
 
 Then in training, load that .npz and build Subset(ds, train_idx/val_idx).
 """

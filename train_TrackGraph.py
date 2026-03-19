@@ -744,6 +744,64 @@ class TrackGraphRegressorGNN(nn.Module):
 # ----------------------------
 # Metrics / losses
 # ----------------------------
+@torch.no_grad()
+def estimate_target_transform(
+    train_ds,
+    device: torch.device,
+    mode: str = "none",
+    max_events: int = -1,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mode = str(mode).lower()
+    eps = float(eps)
+
+    if ddp_is_main():
+        loader = DataLoader(
+            train_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=collate_one,
+        )
+        ys = []
+        for i, batch in enumerate(loader):
+            if max_events > 0 and i >= max_events:
+                break
+            ys.append(batch["y_track"].float().view(1, 3))
+
+        if len(ys) == 0:
+            center = torch.zeros(3, dtype=torch.float32, device=device)
+            scale = torch.ones(3, dtype=torch.float32, device=device)
+        else:
+            y = torch.cat(ys, dim=0).to(device)
+            if mode == "none":
+                center = torch.zeros(3, dtype=torch.float32, device=device)
+                scale = torch.ones(3, dtype=torch.float32, device=device)
+            elif mode == "standard":
+                center = y.mean(dim=0)
+                scale = y.std(dim=0, unbiased=False).clamp(min=eps)
+            elif mode == "robust":
+                q25 = torch.quantile(y, 0.25, dim=0)
+                q50 = torch.quantile(y, 0.50, dim=0)
+                q75 = torch.quantile(y, 0.75, dim=0)
+                center = q50
+                scale = (q75 - q25).clamp(min=eps)
+            elif mode == "minmax":
+                ymin = y.min(dim=0).values
+                ymax = y.max(dim=0).values
+                center = ymin
+                scale = (ymax - ymin).clamp(min=eps)
+            else:
+                raise ValueError(f"Unknown target scaling mode: {mode}")
+    else:
+        center = torch.zeros(3, dtype=torch.float32, device=device)
+        scale = torch.ones(3, dtype=torch.float32, device=device)
+
+    if ddp_is_initialized():
+        dist.broadcast(center, src=0)
+        dist.broadcast(scale, src=0)
+    return center, scale
 
 def build_scheduler(opt, args, steps_per_epoch: int):
     if args.lr_schedule == "plateau":
@@ -901,6 +959,11 @@ def main():
     ap.add_argument("--graph-pool", default="meanmax", choices=["mean", "max", "meanmax"])
 
     ap.add_argument("--loss-type", default="smoothl1", choices=["smoothl1", "mse", "l1"])
+    ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="none",
+                    help="Scale regression targets before loss computation. Use 'robust' if target components have very different ranges or outliers.")
+    ap.add_argument("--target-scale-eps", type=float, default=1e-6,
+                    help="Numerical epsilon for target scaling.")
+    ap.add_argument("--target-stats-max-events", type=int, default=-1)
 
     ap.add_argument("--save", default="track_graph_regressor.pt")
     ap.add_argument("--seed", type=int, default=12345)
@@ -1158,6 +1221,18 @@ def main():
     use_amp = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    
+    target_center, target_scale = estimate_target_transform(
+        train_ds,
+        device=device,
+        mode=args.target_scale,
+        max_events=args.target_stats_max_events,
+        eps=args.target_scale_eps,
+    )
+    if ddp_is_main():
+        print(f"[i] target_scale_mode={args.target_scale}", flush=True)
+        print(f"[i] target_center={target_center.detach().cpu().numpy()}  # [pt_over_q, eta, phi]", flush=True)
+        print(f"[i] target_scale ={target_scale.detach().cpu().numpy()}  # [pt_over_q, eta, phi]", flush=True)
 
     ema = EMA.create(model, decay=args.ema_decay) if args.ema else None
 
@@ -1172,7 +1247,14 @@ def main():
                 project=args.wandb_project,
                 name=args.wandb_name,
                 dir=args.wandb_dir,
-                config=vars(args),
+                config={
+                    **vars(args),
+                    "target_center": target_center.detach().cpu().tolist(),
+                    "target_scale_values": target_scale.detach().cpu().tolist(),
+                    "target_labels": ["pt_over_q", "eta", "phi"],
+                    "xdim": xdim,
+                    "edim": edim,
+                },
             )
         except Exception as e:
             print(f"[wandb] init failed ({type(e).__name__}: {e}). Falling back to offline.")
@@ -1181,7 +1263,14 @@ def main():
                 project=args.wandb_project,
                 name=args.wandb_name,
                 dir=args.wandb_dir,
-                config=vars(args),
+                config={
+                    **vars(args),
+                    "target_center": target_center.detach().cpu().tolist(),
+                    "target_scale_values": target_scale.detach().cpu().tolist(),
+                    "target_labels": ["pt_over_q", "eta", "phi"],
+                    "xdim": xdim,
+                    "edim": edim,
+                },
             )
 
     save_path = _build_save_path(args, run_id)
@@ -1244,11 +1333,13 @@ def main():
 
                 if args.feat_noise_std > 0.0 and model.training:
                     x = x + args.feat_noise_std * torch.randn_like(x)
+                
+                y_train = (y - target_center) / target_scale
 
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     pred = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
-                    loss = regression_loss(pred, y, loss_type=args.loss_type)
+                    loss = regression_loss(pred, y_train, loss_type=args.loss_type)
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -1270,8 +1361,9 @@ def main():
                 train_loss += loss.detach()
                 train_steps += 1.0
 
-                abs_err = (pred.detach() - y).abs().to(torch.float64)
-                sq_err = ((pred.detach() - y) ** 2).to(torch.float64)
+                pred_metric = pred.detach() * target_scale + target_center
+                abs_err = (pred_metric - y).abs().to(torch.float64)
+                sq_err = ((pred_metric - y) ** 2).to(torch.float64)
                 train_abs_err += abs_err
                 train_sq_err += sq_err
 
@@ -1301,16 +1393,20 @@ def main():
                     edge_index = batch["edge_index"].to(device, non_blocking=True)
                     edge_attr = batch["edge_attr"].to(device, non_blocking=True)
                     y = batch["y_track"].to(device, non_blocking=True).float()
+                    
+                    y_eval = (y - target_center) / target_scale
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                         pred = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
-                        loss = regression_loss(pred, y, loss_type=args.loss_type)
-
+                        loss = regression_loss(pred, y_eval, loss_type=args.loss_type)
+                        
                     val_loss += loss
+                    pred_metric = pred * target_scale + target_center
+                    val_loss += loss.detach()
                     val_steps += 1.0
 
-                    abs_err = (pred - y).abs().to(torch.float64)
-                    sq_err = ((pred - y) ** 2).to(torch.float64)
+                    abs_err = (pred_metric - y).abs().to(torch.float64)
+                    sq_err = ((pred_metric - y) ** 2).to(torch.float64)
                     val_abs_err += abs_err
                     val_sq_err += sq_err
 
@@ -1399,6 +1495,10 @@ def main():
                     "fourier_base": args.fourier_base,
                     "fourier_min_exp": args.fourier_min_exp,
                     "fourier_max_exp": args.fourier_max_exp,
+                    "target_scale_mode": args.target_scale,
+                    "target_scale_eps": args.target_scale_eps,
+                    "target_center": target_center.detach().cpu(),
+                    "target_scale": target_scale.detach().cpu(),
                     "best_monitor": best_monitor,
                     "early_stop_monitor": args.early_stop_monitor,
                     "best_ckpt_epoch": best_ckpt_epoch,
