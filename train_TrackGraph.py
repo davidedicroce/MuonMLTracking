@@ -6,7 +6,7 @@ Targets:
   y_track = [pt_over_q, eta, phi]
 
 Launch example:
-torchrun --standalone --nproc_per_node=8 train_TrackGraph.py \
+torchrun --standalone --nproc_per_node=2 train_TrackGraph.py \
     --data-glob "./data/track_graphs_pu0_part*.h5" \
     --split-file "./data/split_track_graphs_pu0_seed12345.npz" \
     --epochs 200 --lr 2e-4 \
@@ -14,18 +14,20 @@ torchrun --standalone --nproc_per_node=8 train_TrackGraph.py \
     --wandb --wandb-project "TrackGraphRegressor" --wandb-name "trackreg01" \
     --early-stop --fourier \
     --weight-decay 0.02 \
+    --target-scale robust --target-stats-max-events 200000 --periodic-phi-loss \
     --edge-dropout 0.1 --feat-noise-std 0.01 \
     --ema --ema-decay 0.999 \
-    --save "track_graph_regressor.pt"
+    --save "track_graph_regressor.pt" 2>&1 | tee log_train.txt
 """
 
 import argparse
 import atexit
 import faulthandler
+import math
+import gc
 import glob
 import os
 import random
-import shutil
 import signal
 import time
 from contextlib import contextmanager, nullcontext
@@ -744,6 +746,16 @@ class TrackGraphRegressorGNN(nn.Module):
 # ----------------------------
 # Metrics / losses
 # ----------------------------
+def _make_stats_loader(dataset, *, num_workers: int = 0):
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False,
+        collate_fn=collate_one,
+    )
+
 @torch.no_grad()
 def estimate_target_transform(
     train_ds,
@@ -755,15 +767,79 @@ def estimate_target_transform(
     mode = str(mode).lower()
     eps = float(eps)
 
-    if ddp_is_main():
-        loader = DataLoader(
-            train_ds,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-            collate_fn=collate_one,
-        )
+    if mode == "none":
+        center = torch.zeros(3, dtype=torch.float32, device=device)
+        scale = torch.ones(3, dtype=torch.float32, device=device)
+        return center, scale
+
+    n_total = len(train_ds)
+    rank = ddp_rank()
+    world = ddp_world_size()
+
+    if world > 1 and mode in ("standard", "minmax"):
+        local_indices = list(range(rank, n_total, world))
+        if max_events > 0:
+            local_cap = max(1, int(np.ceil(max_events / world)))
+            local_indices = local_indices[:local_cap]
+        local_ds = torch.utils.data.Subset(train_ds, local_indices)
+    else:
+        local_ds = train_ds
+
+    if mode == "standard":
+        loader = _make_stats_loader(local_ds, num_workers=0)
+        count = torch.zeros(1, dtype=torch.float64, device=device)
+        sum_y = torch.zeros(3, dtype=torch.float64, device=device)
+        sumsq_y = torch.zeros(3, dtype=torch.float64, device=device)
+
+        for i, batch in enumerate(loader):
+            if world == 1 and max_events > 0 and i >= max_events:
+                break
+            y = batch["y_track"].to(device=device, dtype=torch.float64).view(1, 3)
+            count += 1.0
+            sum_y += y.sum(dim=0)
+            sumsq_y += (y * y).sum(dim=0)
+
+        if ddp_is_initialized():
+            ddp_all_reduce_sum(count)
+            ddp_all_reduce_sum(sum_y)
+            ddp_all_reduce_sum(sumsq_y)
+
+        count = count.clamp(min=1.0)
+        mean = sum_y / count
+        var = (sumsq_y / count) - (mean * mean)
+        var = torch.clamp(var, min=0.0)
+        center = mean.to(torch.float32)
+        scale = torch.sqrt(var).clamp(min=eps).to(torch.float32)
+        return center, scale
+
+    if mode == "minmax":
+        loader = _make_stats_loader(local_ds, num_workers=0)
+        local_min = torch.full((3,), float("inf"), dtype=torch.float32, device=device)
+        local_max = torch.full((3,), float("-inf"), dtype=torch.float32, device=device)
+        seen_any = False
+
+        for i, batch in enumerate(loader):
+            if world == 1 and max_events > 0 and i >= max_events:
+                break
+            y = batch["y_track"].to(device=device, dtype=torch.float32).view(3)
+            local_min = torch.minimum(local_min, y)
+            local_max = torch.maximum(local_max, y)
+            seen_any = True
+
+        if not seen_any:
+            local_min = torch.zeros(3, dtype=torch.float32, device=device)
+            local_max = torch.ones(3, dtype=torch.float32, device=device)
+
+        if ddp_is_initialized():
+            dist.all_reduce(local_min, op=dist.ReduceOp.MIN)
+            dist.all_reduce(local_max, op=dist.ReduceOp.MAX)
+
+        center = local_min
+        scale = (local_max - local_min).clamp(min=eps)
+        return center, scale
+
+    if mode == "robust":
+        loader = _make_stats_loader(train_ds, num_workers=0)
         ys = []
         for i, batch in enumerate(loader):
             if max_events > 0 and i >= max_events:
@@ -775,33 +851,14 @@ def estimate_target_transform(
             scale = torch.ones(3, dtype=torch.float32, device=device)
         else:
             y = torch.cat(ys, dim=0).to(device)
-            if mode == "none":
-                center = torch.zeros(3, dtype=torch.float32, device=device)
-                scale = torch.ones(3, dtype=torch.float32, device=device)
-            elif mode == "standard":
-                center = y.mean(dim=0)
-                scale = y.std(dim=0, unbiased=False).clamp(min=eps)
-            elif mode == "robust":
-                q25 = torch.quantile(y, 0.25, dim=0)
-                q50 = torch.quantile(y, 0.50, dim=0)
-                q75 = torch.quantile(y, 0.75, dim=0)
-                center = q50
-                scale = (q75 - q25).clamp(min=eps)
-            elif mode == "minmax":
-                ymin = y.min(dim=0).values
-                ymax = y.max(dim=0).values
-                center = ymin
-                scale = (ymax - ymin).clamp(min=eps)
-            else:
-                raise ValueError(f"Unknown target scaling mode: {mode}")
-    else:
-        center = torch.zeros(3, dtype=torch.float32, device=device)
-        scale = torch.ones(3, dtype=torch.float32, device=device)
+            q25 = torch.quantile(y, 0.25, dim=0)
+            q50 = torch.quantile(y, 0.50, dim=0)
+            q75 = torch.quantile(y, 0.75, dim=0)
+            center = q50
+            scale = (q75 - q25).clamp(min=eps)
+        return center, scale
 
-    if ddp_is_initialized():
-        dist.broadcast(center, src=0)
-        dist.broadcast(scale, src=0)
-    return center, scale
+    raise ValueError(f"Unknown target scaling mode: {mode}")
 
 def build_scheduler(opt, args, steps_per_epoch: int):
     if args.lr_schedule == "plateau":
@@ -811,7 +868,6 @@ def build_scheduler(opt, args, steps_per_epoch: int):
             factor=args.lr_plateau_factor,
             patience=args.lr_plateau_patience,
             min_lr=args.lr_plateau_min_lr,
-            verbose=ddp_is_main(),
         )
 
     warmup_steps = int(args.warmup_epochs * steps_per_epoch)
@@ -898,21 +954,48 @@ def _try_resume_from_checkpoint(
     return start_epoch, best_monitor, bad_epochs, best_ckpt_epoch, True
 
 
-def regression_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "smoothl1") -> torch.Tensor:
+def wrapped_angle_diff(pred_phi: torch.Tensor, target_phi: torch.Tensor, period: float = 2.0 * math.pi) -> torch.Tensor:
+    half_period = 0.5 * float(period)
+    return torch.remainder(pred_phi - target_phi + half_period, float(period)) - half_period
+
+
+def regression_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str = "smoothl1",
+    *,
+    periodic_phi_loss: bool = False,
+    phi_period: float = 2.0 * math.pi,
+) -> torch.Tensor:
+    diff = pred - target
+    if periodic_phi_loss:
+        diff = diff.clone()
+        diff[2] = wrapped_angle_diff(pred[2], target[2], period=phi_period)
+
     if loss_type == "mse":
-        return F.mse_loss(pred, target)
+        return diff.pow(2).mean()
     if loss_type == "l1":
-        return F.l1_loss(pred, target)
+        return diff.abs().mean()
     if loss_type == "smoothl1":
-        return F.smooth_l1_loss(pred, target, beta=1.0)
+        return F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=1.0)
     raise ValueError(f"Unknown loss_type={loss_type}")
 
 
 @torch.no_grad()
-def regression_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
-    abs_err = (pred - target).abs()
-    sq_err = (pred - target) ** 2
+def regression_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    periodic_phi_loss: bool = False,
+    phi_period: float = 2.0 * math.pi,
+) -> Dict[str, float]:
+    diff = pred - target
+    if periodic_phi_loss:
+        diff = diff.clone()
+        diff[2] = wrapped_angle_diff(pred[2], target[2], period=phi_period)
 
+    abs_err = diff.abs()
+    sq_err = diff ** 2
     mae_ptq = float(abs_err[0].item())
     mae_eta = float(abs_err[1].item())
     mae_phi = float(abs_err[2].item())
@@ -934,6 +1017,18 @@ def regression_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, fl
         "mae_mean": mae_mean,
         "rmse_mean": rmse_mean,
     }
+    
+def infer_dims_from_subset(subset) -> Tuple[int, int, int]:
+    """
+    Infer x / edge_attr / y dims directly from the dataset item,
+    without creating a DataLoader iterator. This avoids leaving an
+    extra persistent-worker iterator and prefetched batches alive.
+    """
+    sample = subset[0]
+    xdim = int(sample["x"].shape[1])
+    edim = int(sample["edge_attr"].shape[1])
+    ydim = int(sample["y_track"].shape[0])
+    return xdim, edim, ydim
 
 
 # ----------------------------
@@ -965,6 +1060,12 @@ def main():
                     help="Numerical epsilon for target scaling.")
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
 
+    ap.add_argument("--periodic-phi-loss", action="store_true", default=False,
+                    help="Use shortest wrapped angular difference for the phi target in loss and metrics.")
+    ap.add_argument("--no-periodic-phi-loss", dest="periodic_phi_loss", action="store_false")
+    ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi),
+                    help="Period used for wrapped phi differences. Default is 2*pi.")
+
     ap.add_argument("--save", default="track_graph_regressor.pt")
     ap.add_argument("--seed", type=int, default=12345)
 
@@ -973,10 +1074,10 @@ def main():
 
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--pin-memory", action="store_true", default=True)
-    ap.add_argument("--prefetch-factor", type=int, default=4)
-    ap.add_argument("--persistent-workers", dest="persistent_workers", action="store_true", default=True)
+    ap.add_argument("--prefetch-factor", type=int, default=2)
+    ap.add_argument("--persistent-workers", dest="persistent_workers", action="store_true", default=False)
     ap.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
-    ap.add_argument("--worker-start-method", type=str, default="fork", choices=["fork", "forkserver", "spawn"])
+    ap.add_argument("--worker-start-method", type=str, default="spawn", choices=["fork", "forkserver", "spawn"])
 
     ap.add_argument("--amp", action="store_true", default=True)
     ap.add_argument("--no-amp", dest="amp", action="store_false")
@@ -1111,31 +1212,31 @@ def main():
         val_ds, num_replicas=ddp_world_size(), rank=ddp_rank(), shuffle=False, drop_last=True
     ) if ddp_is_initialized() else None
 
+
+    loader_kwargs = dict(    
+        collate_fn=collate_one,
+        num_workers=int(args.num_workers),
+        pin_memory=args.pin_memory,
+        multiprocessing_context=ctx,
+        persistent_workers=(args.persistent_workers and args.num_workers > 0),
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+    )
+    
+    # Avoid pin_memory_device here. It is not needed for this workload and can
+    # increase pinned-host-memory pressure on some systems.
     train_loader = DataLoader(
         train_ds,
         batch_size=1,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        collate_fn=collate_one,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        multiprocessing_context=ctx,
-        persistent_workers=(args.persistent_workers and args.num_workers > 0),
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-        pin_memory_device=f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}" if torch.cuda.is_available() else "",
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=1,
         shuffle=False,
         sampler=val_sampler,
-        collate_fn=collate_one,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        multiprocessing_context=ctx,
-        persistent_workers=(args.persistent_workers and args.num_workers > 0),
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-        pin_memory_device=f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}" if torch.cuda.is_available() else "",
+        **loader_kwargs,
     )
 
     if ddp_is_initialized():
@@ -1158,10 +1259,8 @@ def main():
         print(f"[i] ddp world_size={ddp_world_size()} device={device}")
         print(f"[i] graphs: train={len(train_ds)} val={len(val_ds)} total={len(ds)} split={args.split_file}")
 
-    sample = next(iter(train_loader))
-    xdim = sample["x"].shape[1]
-    edim = sample["edge_attr"].shape[1]
-    ydim = sample["y_track"].shape[0]
+    xdim, edim, ydim = infer_dims_from_subset(train_ds)
+    gc.collect()
     if ydim != 3:
         raise RuntimeError(f"Expected y_track dim=3, got {ydim}")
     if ddp_is_main():
@@ -1220,7 +1319,7 @@ def main():
 
     use_amp = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
     
     target_center, target_scale = estimate_target_transform(
         train_ds,
@@ -1233,6 +1332,7 @@ def main():
         print(f"[i] target_scale_mode={args.target_scale}", flush=True)
         print(f"[i] target_center={target_center.detach().cpu().numpy()}  # [pt_over_q, eta, phi]", flush=True)
         print(f"[i] target_scale ={target_scale.detach().cpu().numpy()}  # [pt_over_q, eta, phi]", flush=True)
+        print(f"[i] periodic_phi_loss={args.periodic_phi_loss} phi_period={args.phi_period}", flush=True)
 
     ema = EMA.create(model, decay=args.ema_decay) if args.ema else None
 
@@ -1253,6 +1353,8 @@ def main():
                     "target_scale_values": target_scale.detach().cpu().tolist(),
                     "target_labels": ["pt_over_q", "eta", "phi"],
                     "xdim": xdim,
+                    "periodic_phi_loss": args.periodic_phi_loss,
+                    "phi_period": args.phi_period,
                     "edim": edim,
                 },
             )
@@ -1269,6 +1371,8 @@ def main():
                     "target_scale_values": target_scale.detach().cpu().tolist(),
                     "target_labels": ["pt_over_q", "eta", "phi"],
                     "xdim": xdim,
+                    "periodic_phi_loss": args.periodic_phi_loss,
+                    "phi_period": args.phi_period,
                     "edim": edim,
                 },
             )
@@ -1339,7 +1443,13 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     pred = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
-                    loss = regression_loss(pred, y_train, loss_type=args.loss_type)
+                    loss = regression_loss(
+                        pred,
+                        y_train,
+                        loss_type=args.loss_type,
+                        periodic_phi_loss=args.periodic_phi_loss,
+                        phi_period=(args.phi_period / float(target_scale[2].item())),
+                    )
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -1362,10 +1472,20 @@ def main():
                 train_steps += 1.0
 
                 pred_metric = pred.detach() * target_scale + target_center
-                abs_err = (pred_metric - y).abs().to(torch.float64)
-                sq_err = ((pred_metric - y) ** 2).to(torch.float64)
+                diff_metric = pred_metric - y
+                if args.periodic_phi_loss:
+                    diff_metric = diff_metric.clone()
+                    diff_metric[2] = wrapped_angle_diff(pred_metric[2], y[2], period=args.phi_period)
+                abs_err = diff_metric.abs().to(torch.float64)
+                sq_err = (diff_metric ** 2).to(torch.float64)
                 train_abs_err += abs_err
                 train_sq_err += sq_err
+                
+                del x, edge_index, edge_attr, y, y_train, pred, loss, pred_metric, diff_metric, abs_err, sq_err
+                
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         ddp_all_reduce_sum(train_loss)
         ddp_all_reduce_sum(train_steps)
@@ -1398,17 +1518,32 @@ def main():
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                         pred = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
-                        loss = regression_loss(pred, y_eval, loss_type=args.loss_type)
+                        loss = regression_loss(
+                            pred,
+                            y_eval,
+                            loss_type=args.loss_type,
+                            periodic_phi_loss=args.periodic_phi_loss,
+                            phi_period=(args.phi_period / float(target_scale[2].item())),
+                        )
                         
-                    val_loss += loss
                     pred_metric = pred * target_scale + target_center
                     val_loss += loss.detach()
                     val_steps += 1.0
 
-                    abs_err = (pred_metric - y).abs().to(torch.float64)
-                    sq_err = ((pred_metric - y) ** 2).to(torch.float64)
+                    diff_metric = pred_metric - y
+                    if args.periodic_phi_loss:
+                        diff_metric = diff_metric.clone()
+                        diff_metric[2] = wrapped_angle_diff(pred_metric[2], y[2], period=args.phi_period)
+                    abs_err = diff_metric.abs().to(torch.float64)
+                    sq_err = (diff_metric ** 2).to(torch.float64)
                     val_abs_err += abs_err
                     val_sq_err += sq_err
+                    
+                    del x, edge_index, edge_attr, y, y_eval, pred, loss, pred_metric, diff_metric, abs_err, sq_err
+
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         ddp_all_reduce_sum(val_loss)
         ddp_all_reduce_sum(val_steps)
@@ -1499,6 +1634,8 @@ def main():
                     "target_scale_eps": args.target_scale_eps,
                     "target_center": target_center.detach().cpu(),
                     "target_scale": target_scale.detach().cpu(),
+                    "periodic_phi_loss": args.periodic_phi_loss,
+                    "phi_period": args.phi_period,
                     "best_monitor": best_monitor,
                     "early_stop_monitor": args.early_stop_monitor,
                     "best_ckpt_epoch": best_ckpt_epoch,
@@ -1565,7 +1702,7 @@ def main():
             if ema is not None:
                 ema = EMA.create(model, decay=args.ema_decay)
             if scaler.is_enabled():
-                scaler = torch.cuda.amp.GradScaler(enabled=True)
+                scaler = torch.amp.GradScaler("cuda", enabled=True)
             if args.early_stop:
                 bad_epochs = 0
             ddp_barrier()

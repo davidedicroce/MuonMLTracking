@@ -4,3 +4,5 @@ data/
 log_*.txt
 __pycache__/
 *.pyc
+*.pt
+wandb/*
