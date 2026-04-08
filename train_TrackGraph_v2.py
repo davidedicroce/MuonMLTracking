@@ -213,11 +213,7 @@ class H5TrackGraphDataset(Dataset):
       /graphs/<id>/x
       /graphs/<id>/edge_index
       /graphs/<id>/edge_attr
-      /graphs/<id>/y_track   # [pt_over_q, eta, phi]
-
-    NOTE:
-    This script treats the first component consistently as "pt_over_q" and leaves
-    the semantic naming to the user/config.
+      /graphs/<id>/y_track   # [ptq, eta, phi]
     """
 
     def __init__(self, h5_paths):
@@ -287,7 +283,7 @@ class H5TrackGraphDataset(Dataset):
         if "y_track" not in g:
             raise RuntimeError(
                 f"Missing 'y_track' in {self.h5_paths[fi]} /graphs/{k}. "
-                f"Expected y_track = [pt_over_q, eta, phi]."
+                f"Expected y_track = [ptq, eta, phi]."
             )
         y_track = torch.from_numpy(g["y_track"][...]).float()
 
@@ -899,7 +895,7 @@ def estimate_target_transform(
 
     def get_y2(batch):
         y = batch["y_track"].view(3)
-        return y[:2]  # only pt_over_q and eta are scaled here; phi handled separately
+        return y[:2]  # only ptq and eta are scaled here; phi handled separately
 
     if mode == "standard":
         loader = _make_stats_loader(local_ds, num_workers=0)
@@ -1282,7 +1278,7 @@ def main():
     ap.add_argument("--phi-mode", default="sincos", choices=["sincos", "scalar"], help="Use sin/cos head for phi by default.")
     ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi))
     ap.add_argument("--phi-vec-weight", type=float, default=1.0, help="Extra multiplier for the sin/cos phi loss.")
-    ap.add_argument("--target-loss-weights", default="1.0,1.0,1.0", help="Weights for pt_over_q, eta, phi losses.")
+    ap.add_argument("--target-loss-weights", default="1.0,1.0,1.0", help="Weights for ptq, eta, phi losses.")
 
     ap.add_argument("--save", default="track_graph_regressor_v2.pt")
     ap.add_argument("--seed", type=int, default=12345)
@@ -1517,8 +1513,8 @@ def main():
 
     if ddp_is_main():
         print(f"[i] target_scale_mode={args.target_scale}", flush=True)
-        print(f"[i] target_center_linear={target_center_2.detach().cpu().numpy()}  # [pt_over_q, eta]", flush=True)
-        print(f"[i] target_scale_linear ={target_scale_2.detach().cpu().numpy()}  # [pt_over_q, eta]", flush=True)
+        print(f"[i] target_center_linear={target_center_2.detach().cpu().numpy()}  # [ptq, eta]", flush=True)
+        print(f"[i] target_scale_linear ={target_scale_2.detach().cpu().numpy()}  # [ptq, eta]", flush=True)
         print(f"[i] phi_mode={args.phi_mode} phi_period={args.phi_period}", flush=True)
         print(f"[i] target_loss_weights={target_weights.detach().cpu().tolist()}", flush=True)
 
@@ -1840,11 +1836,11 @@ def main():
                 f"[epoch {epoch:03d}] "
                 f"train loss={train_loss_mean:.5f} parts=({train_loss_parts_mean[0]:.5f},{train_loss_parts_mean[1]:.5f},{train_loss_parts_mean[2]:.5f}) "
                 f"mae=({train_mae[0]:.4f},{train_mae[1]:.4f},{train_mae[2]:.4f}) "
-                f"smape=({train_smape[0]:.2f}%,{train_smape[1]:.2f}%,{train_smape[2]:.2f}%) pt_over_q_mape={train_pt_mape:.2f}% "
+                f"smape=({train_smape[0]:.2f}%,{train_smape[1]:.2f}%,{train_smape[2]:.2f}%) ptq_mape={train_pt_mape:.2f}% "
                 f"rmse_mean={train_rmse_mean:.4f} | "
                 f"val loss={val_loss_mean:.5f} parts=({val_loss_parts_mean[0]:.5f},{val_loss_parts_mean[1]:.5f},{val_loss_parts_mean[2]:.5f}) "
                 f"mae=({val_mae[0]:.4f},{val_mae[1]:.4f},{val_mae[2]:.4f}) "
-                f"smape=({val_smape[0]:.2f}%,{val_smape[1]:.2f}%,{val_smape[2]:.2f}%) pt_over_q_mape={val_pt_mape:.2f}% "
+                f"smape=({val_smape[0]:.2f}%,{val_smape[1]:.2f}%,{val_smape[2]:.2f}%) ptq_mape={val_pt_mape:.2f}% "
                 f"rmse_mean={val_rmse_mean:.4f} | "
                 f"lr={current_lr:.3e} | "
                 f"{args.early_stop_monitor}={monitor_val:.6f} {'(best)' if improved else ''}"
@@ -1855,32 +1851,32 @@ def main():
                 {
                     "epoch": epoch,
                     "train/loss": train_loss_mean,
-                    "train/loss_pt_over_q": float(train_loss_parts_mean[0]),
+                    "train/loss_ptq": float(train_loss_parts_mean[0]),
                     "train/loss_eta": float(train_loss_parts_mean[1]),
                     "train/loss_phi": float(train_loss_parts_mean[2]),
-                    "train/mae_pt_over_q": float(train_mae[0]),
+                    "train/mae_ptq": float(train_mae[0]),
                     "train/mae_eta": float(train_mae[1]),
                     "train/mae_phi": float(train_mae[2]),
-                    "train/smape_pt_over_q": float(train_smape[0]),
+                    "train/smape_ptq": float(train_smape[0]),
                     "train/smape_eta": float(train_smape[1]),
                     "train/smape_phi": float(train_smape[2]),
-                    "train/pt_over_q_mape": float(train_pt_mape),
-                    "train/rmse_pt_over_q": float(train_rmse[0]),
+                    "train/ptq_mape": float(train_pt_mape),
+                    "train/rmse_ptq": float(train_rmse[0]),
                     "train/rmse_eta": float(train_rmse[1]),
                     "train/rmse_phi": float(train_rmse[2]),
                     "train/rmse_mean": train_rmse_mean,
                     "val/loss": val_loss_mean,
-                    "val/loss_pt_over_q": float(val_loss_parts_mean[0]),
+                    "val/loss_ptq": float(val_loss_parts_mean[0]),
                     "val/loss_eta": float(val_loss_parts_mean[1]),
                     "val/loss_phi": float(val_loss_parts_mean[2]),
-                    "val/mae_pt_over_q": float(val_mae[0]),
+                    "val/mae_ptq": float(val_mae[0]),
                     "val/mae_eta": float(val_mae[1]),
                     "val/mae_phi": float(val_mae[2]),
-                    "val/smape_pt_over_q": float(val_smape[0]),
+                    "val/smape_ptq": float(val_smape[0]),
                     "val/smape_eta": float(val_smape[1]),
                     "val/smape_phi": float(val_smape[2]),
-                    "val/pt_over_q_mape": float(val_pt_mape),
-                    "val/rmse_pt_over_q": float(val_rmse[0]),
+                    "val/ptq_mape": float(val_pt_mape),
+                    "val/rmse_ptq": float(val_rmse[0]),
                     "val/rmse_eta": float(val_rmse[1]),
                     "val/rmse_phi": float(val_rmse[2]),
                     "val/rmse_mean": val_rmse_mean,
