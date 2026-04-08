@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
 """
-DDP multi-GPU training for graph-level track regression GNN.
+train_TrackGraph_v2.py
 
-Targets:
-  y_track = [q_over_pt, eta, phi]
+Main changes vs v1:
+- The training loss is explicit per target instead of a blind mean over all outputs.
+- phi can be trained as a 2D angle head (sin(phi), cos(phi)) to avoid wrap/discontinuity issues.
+- MAPE is reported only for the pt-like target by default; eta/phi instead use SMAPE,
+  because percentage error is usually ill-defined around zero for eta and especially phi.
+- Per-component losses are logged, so you can see whether one target dominates.
+- Optional manual target weights allow you to stop one component from dominating.
 
-Launch example:
-torchrun --standalone --nproc_per_node=1 train_TrackGraph.py \
-    --data-glob "./data/track_graphs_pu0_part*.h5" \
-    --split-file "./data/split_track_graphs_pu0_seed12345.npz" \
-    --epochs 200 --lr 2e-4 \
-    --num-workers 4 --pin-memory \
-    --wandb --wandb-project "TrackGraphRegressor" --wandb-name "trackreg01" \
-    --early-stop --fourier \
-    --weight-decay 0.02 \
-    --target-scale robust --target-stats-max-events 100000 --periodic-phi-loss \
-    --edge-dropout 0.1 --feat-noise-std 0.01 \
-    --ema --ema-decay 0.999 \
-    --save "track_graph_regressor.pt" 2>&1 | tee log_train.txt
+The rest of the data format and most CLI conventions are kept close to v1.
 """
 
 import argparse
 import atexit
 import faulthandler
-import math
-import traceback
-import json
 import gc
 import glob
+import json
+import math
 import os
 import random
 import signal
 import time
+import traceback
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
 
 import h5py
 import numpy as np
@@ -55,9 +50,6 @@ import wandb
 # ----------------------------
 # IO helpers
 # ----------------------------
-
-os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
 
 def _ensure_parent_dir(path: str) -> None:
     try:
@@ -126,11 +118,6 @@ def _jsonable_error(exc: Exception) -> Dict[str, Any]:
         "message": str(exc),
         "traceback": traceback.format_exc(),
     }
-
-
-def _is_cuda_illegal_access_error(exc: BaseException) -> bool:
-    s = str(exc).lower()
-    return ("illegal memory access" in s) or ("device-side assert" in s) or ("cuda error" in s)
 
 
 # ----------------------------
@@ -226,7 +213,11 @@ class H5TrackGraphDataset(Dataset):
       /graphs/<id>/x
       /graphs/<id>/edge_index
       /graphs/<id>/edge_attr
-      /graphs/<id>/y_track    # [pt_over_q, eta, phi]
+      /graphs/<id>/y_track   # [pt_over_q, eta, phi]
+
+    NOTE:
+    This script treats the first component consistently as "pt_over_q" and leaves
+    the semantic naming to the user/config.
     """
 
     def __init__(self, h5_paths):
@@ -251,10 +242,6 @@ class H5TrackGraphDataset(Dataset):
         self._pid = None
 
     def __getstate__(self):
-        """
-        Make the dataset safe for DataLoader multiprocessing with spawn/forkserver.
-        h5py.File handles are not picklable, so never serialize live handles.
-        """
         state = self.__dict__.copy()
         state["_files"] = None
         state["_pid"] = None
@@ -300,7 +287,7 @@ class H5TrackGraphDataset(Dataset):
         if "y_track" not in g:
             raise RuntimeError(
                 f"Missing 'y_track' in {self.h5_paths[fi]} /graphs/{k}. "
-                f"Please update your converter to store y_track = [q_over_pt, eta, phi]."
+                f"Expected y_track = [pt_over_q, eta, phi]."
             )
         y_track = torch.from_numpy(g["y_track"][...]).float()
 
@@ -331,10 +318,6 @@ def _batch_id_string(batch: Dict[str, Any]) -> str:
 
 
 def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
-    """
-    Catch malformed graphs on CPU before they can trigger opaque CUDA illegal
-    memory access errors inside indexing/scatter kernels.
-    """
     bid = _batch_id_string(batch)
 
     for req in ("x", "edge_index", "edge_attr", "y_track"):
@@ -388,12 +371,7 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
                 f"bad_positions={bad_preview}"
             )
 
-    finite_checks = [
-        ("x", x),
-        ("edge_attr", edge_attr),
-        ("y_track", y),
-    ]
-    for name, t in finite_checks:
+    for name, t in (("x", x), ("edge_attr", edge_attr), ("y_track", y)):
         if not torch.isfinite(t).all():
             nz = (~torch.isfinite(t)).nonzero(as_tuple=False)
             preview = nz[:8].tolist()
@@ -401,7 +379,6 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
                 f"[validate:{where}] non-finite values found in {name} for {bid}; positions={preview}"
             )
 
-    # Additional cheap sanity checks for later CUDA kernels.
     if not x.is_contiguous():
         batch["x"] = x.contiguous()
     if not edge_index.is_contiguous():
@@ -410,9 +387,6 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
         batch["edge_attr"] = edge_attr.contiguous()
     if not y.is_contiguous():
         batch["y_track"] = y.contiguous()
-
-    if edge_index.numel() > 0 and edge_index.shape[1] == 0:
-        raise RuntimeError(f"[validate:{where}] edge_index has malformed empty second dim in {bid}")
 
 
 # ----------------------------
@@ -733,20 +707,12 @@ class EdgeMPNNLayer(nn.Module):
         self.node_mlp = MLP(in_dim=2 * hdim, out_dim=hdim, hidden_dim=upd_hidden, n_layers=2, dropout=dropout)
         self.norm = nn.LayerNorm(hdim)
 
-    def _ddp_touch_edge_mlp(self) -> torch.Tensor:
-        z = None
-        for p in self.edge_mlp.parameters():
-            z = (p.sum() * 0.0) if z is None else (z + p.sum() * 0.0)
-        return z if z is not None else torch.tensor(0.0)
-
     def forward(self, h, edge_index, edge_attr, edge_dropout_p: float = 0.0):
         E = edge_attr.size(0)
-
         if E == 0:
             agg = torch.zeros_like(h)
             h_upd = self.node_mlp(torch.cat([h, agg], dim=1))
-            touch = self._ddp_touch_edge_mlp().to(h.device)
-            return self.norm(h + h_upd) + touch
+            return self.norm(h + h_upd)
 
         src = edge_index[0]
         dst = edge_index[1]
@@ -767,7 +733,6 @@ class EdgeMPNNLayer(nn.Module):
 
         h_src = h[src]
         h_dst = h[dst]
-
         m_in = torch.cat([h_src, h_dst, edge_attr], dim=1)
         m = self.edge_mlp(m_in)
 
@@ -797,6 +762,7 @@ class TrackGraphRegressorGNN(nn.Module):
         fourier_min_exp=-6,
         fourier_max_exp=6,
         graph_pool: str = "meanmax",
+        phi_mode: str = "sincos",
     ):
         super().__init__()
         self.fourier = None
@@ -805,6 +771,7 @@ class TrackGraphRegressorGNN(nn.Module):
         self.sage_aggr = sage_aggr
         self.edgeconv_aggr = edgeconv_aggr
         self.graph_pool = graph_pool
+        self.phi_mode = phi_mode
 
         if use_fourier:
             self.fourier = FourierEncoder(xdim, base=fourier_base, min_exp=fourier_min_exp, max_exp=fourier_max_exp)
@@ -844,11 +811,15 @@ class TrackGraphRegressorGNN(nn.Module):
             raise ValueError(f"Unknown layer_type={layer_type}")
 
         pooled_dim = hdim if graph_pool in ("mean", "max") else 2 * hdim
-        self.graph_head = MLP(pooled_dim, 3, hidden_dim=hdim, n_layers=2, dropout=dropout)
+        self.head_pt = MLP(pooled_dim, 1, hidden_dim=hdim, n_layers=2, dropout=dropout)
+        self.head_eta = MLP(pooled_dim, 1, hidden_dim=hdim, n_layers=2, dropout=dropout)
+        phi_out_dim = 2 if phi_mode == "sincos" else 1
+        self.head_phi = MLP(pooled_dim, phi_out_dim, hidden_dim=hdim, n_layers=2, dropout=dropout)
 
     def _pool_graph(self, h: torch.Tensor) -> torch.Tensor:
+        pooled_dim = self.head_pt.net[0].in_features
         if h.size(0) == 0:
-            return h.new_zeros((1, self.graph_head.net[0].in_features), dtype=h.dtype)
+            return h.new_zeros((1, pooled_dim), dtype=h.dtype)
 
         if self.graph_pool == "mean":
             return h.mean(dim=0, keepdim=True)
@@ -872,13 +843,20 @@ class TrackGraphRegressorGNN(nn.Module):
                 h = layer(h, edge_index)
 
         g = self._pool_graph(h)
-        out = self.graph_head(g).squeeze(0)   # (3,)
-        return out
+        pt = self.head_pt(g).squeeze(0).squeeze(-1)
+        eta = self.head_eta(g).squeeze(0).squeeze(-1)
+        phi_raw = self.head_phi(g).squeeze(0)
+        return {
+            "pt": pt,
+            "eta": eta,
+            "phi_raw": phi_raw,
+        }
 
 
 # ----------------------------
-# Metrics / losses
+# Stats / scaling
 # ----------------------------
+
 def _make_stats_loader(dataset, *, num_workers: int = 0):
     return DataLoader(
         dataset,
@@ -888,6 +866,7 @@ def _make_stats_loader(dataset, *, num_workers: int = 0):
         pin_memory=False,
         collate_fn=collate_one,
     )
+
 
 @torch.no_grad()
 def estimate_target_transform(
@@ -901,8 +880,8 @@ def estimate_target_transform(
     eps = float(eps)
 
     if mode == "none":
-        center = torch.zeros(3, dtype=torch.float32, device=device)
-        scale = torch.ones(3, dtype=torch.float32, device=device)
+        center = torch.zeros(2, dtype=torch.float32, device=device)
+        scale = torch.ones(2, dtype=torch.float32, device=device)
         return center, scale
 
     n_total = len(train_ds)
@@ -918,16 +897,20 @@ def estimate_target_transform(
     else:
         local_ds = train_ds
 
+    def get_y2(batch):
+        y = batch["y_track"].view(3)
+        return y[:2]  # only pt_over_q and eta are scaled here; phi handled separately
+
     if mode == "standard":
         loader = _make_stats_loader(local_ds, num_workers=0)
         count = torch.zeros(1, dtype=torch.float64, device=device)
-        sum_y = torch.zeros(3, dtype=torch.float64, device=device)
-        sumsq_y = torch.zeros(3, dtype=torch.float64, device=device)
+        sum_y = torch.zeros(2, dtype=torch.float64, device=device)
+        sumsq_y = torch.zeros(2, dtype=torch.float64, device=device)
 
         for i, batch in enumerate(loader):
             if world == 1 and max_events > 0 and i >= max_events:
                 break
-            y = batch["y_track"].to(device=device, dtype=torch.float64).view(1, 3)
+            y = get_y2(batch).to(device=device, dtype=torch.float64).view(1, 2)
             count += 1.0
             sum_y += y.sum(dim=0)
             sumsq_y += (y * y).sum(dim=0)
@@ -947,21 +930,21 @@ def estimate_target_transform(
 
     if mode == "minmax":
         loader = _make_stats_loader(local_ds, num_workers=0)
-        local_min = torch.full((3,), float("inf"), dtype=torch.float32, device=device)
-        local_max = torch.full((3,), float("-inf"), dtype=torch.float32, device=device)
+        local_min = torch.full((2,), float("inf"), dtype=torch.float32, device=device)
+        local_max = torch.full((2,), float("-inf"), dtype=torch.float32, device=device)
         seen_any = False
 
         for i, batch in enumerate(loader):
             if world == 1 and max_events > 0 and i >= max_events:
                 break
-            y = batch["y_track"].to(device=device, dtype=torch.float32).view(3)
+            y = get_y2(batch).to(device=device, dtype=torch.float32).view(2)
             local_min = torch.minimum(local_min, y)
             local_max = torch.maximum(local_max, y)
             seen_any = True
 
         if not seen_any:
-            local_min = torch.zeros(3, dtype=torch.float32, device=device)
-            local_max = torch.ones(3, dtype=torch.float32, device=device)
+            local_min = torch.zeros(2, dtype=torch.float32, device=device)
+            local_max = torch.ones(2, dtype=torch.float32, device=device)
 
         if ddp_is_initialized():
             dist.all_reduce(local_min, op=dist.ReduceOp.MIN)
@@ -977,11 +960,11 @@ def estimate_target_transform(
         for i, batch in enumerate(loader):
             if max_events > 0 and i >= max_events:
                 break
-            ys.append(batch["y_track"].float().view(1, 3))
+            ys.append(get_y2(batch).float().view(1, 2))
 
         if len(ys) == 0:
-            center = torch.zeros(3, dtype=torch.float32, device=device)
-            scale = torch.ones(3, dtype=torch.float32, device=device)
+            center = torch.zeros(2, dtype=torch.float32, device=device)
+            scale = torch.ones(2, dtype=torch.float32, device=device)
         else:
             y = torch.cat(ys, dim=0).to(device)
             q25 = torch.quantile(y, 0.25, dim=0)
@@ -992,6 +975,7 @@ def estimate_target_transform(
         return center, scale
 
     raise ValueError(f"Unknown target scaling mode: {mode}")
+
 
 def build_scheduler(opt, args, steps_per_epoch: int):
     if args.lr_schedule == "plateau":
@@ -1036,28 +1020,12 @@ def _try_resume_from_checkpoint(
     opt: torch.optim.Optimizer,
     scheduler,
     scaler: torch.cuda.amp.GradScaler,
-    ema: Optional["EMA"],
+    ema: Optional[EMA],
     device: torch.device,
 ) -> Tuple[int, Optional[float], int, Optional[int], bool]:
     p = Path(ckpt_path)
     if not p.exists():
         return 1, None, 0, None, False
-
-    def _move_ema_shadow_to_model_device_dtype(
-        ema_shadow: Dict[str, torch.Tensor],
-        model_state: Dict[str, torch.Tensor],
-        fallback_device: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {}
-        for k, v in ema_shadow.items():
-            if not torch.is_tensor(v):
-                continue
-            if k in model_state:
-                ref = model_state[k]
-                out[k] = v.detach().to(device=ref.device, dtype=ref.dtype).clone()
-            else:
-                out[k] = v.detach().to(device=fallback_device).clone()
-        return out
 
     ckpt = torch.load(str(p), map_location="cpu")
     raw_model = model.module if hasattr(model, "module") else model
@@ -1077,7 +1045,17 @@ def _try_resume_from_checkpoint(
         except Exception:
             pass
     if ema is not None and "ema_shadow" in ckpt and isinstance(ckpt["ema_shadow"], dict):
-        ema.shadow = _move_ema_shadow_to_model_device_dtype(ckpt["ema_shadow"], raw_model.state_dict(), device)
+        raw_state = raw_model.state_dict()
+        fixed_shadow = {}
+        for k, v in ckpt["ema_shadow"].items():
+            if not torch.is_tensor(v):
+                continue
+            if k in raw_state:
+                ref = raw_state[k]
+                fixed_shadow[k] = v.detach().to(device=ref.device, dtype=ref.dtype).clone()
+            else:
+                fixed_shadow[k] = v.detach().to(device=device).clone()
+        ema.shadow = fixed_shadow
 
     last_epoch = int(ckpt.get("epoch", 0))
     best_monitor = ckpt.get("best_monitor", None)
@@ -1087,110 +1065,133 @@ def _try_resume_from_checkpoint(
     return start_epoch, best_monitor, bad_epochs, best_ckpt_epoch, True
 
 
+# ----------------------------
+# Losses / metrics
+# ----------------------------
+
 def wrapped_angle_diff(pred_phi: torch.Tensor, target_phi: torch.Tensor, period: float = 2.0 * math.pi) -> torch.Tensor:
     half_period = 0.5 * float(period)
     return torch.remainder(pred_phi - target_phi + half_period, float(period)) - half_period
 
 
-def regression_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    loss_type: str = "smoothl1",
-    *,
-    periodic_phi_loss: bool = False,
-    phi_period: float = 2.0 * math.pi,
-) -> torch.Tensor:
-    diff = pred - target
-    if periodic_phi_loss:
-        diff = diff.clone()
-        diff[2] = wrapped_angle_diff(pred[2], target[2], period=phi_period)
+def angle_from_sincos(sin_cos: torch.Tensor) -> torch.Tensor:
+    if sin_cos.ndim == 1:
+        s = sin_cos[0]
+        c = sin_cos[1]
+    else:
+        s = sin_cos[..., 0]
+        c = sin_cos[..., 1]
+    return torch.atan2(s, c)
 
+
+def component_regression_loss(diff: torch.Tensor, loss_type: str = "smoothl1", beta: float = 1.0) -> torch.Tensor:
     if loss_type == "mse":
-        return diff.pow(2).mean()
+        return diff.pow(2)
     if loss_type == "l1":
-        return diff.abs().mean()
+        return diff.abs()
     if loss_type == "smoothl1":
-        return F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=1.0)
+        return F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=beta, reduction="none")
     raise ValueError(f"Unknown loss_type={loss_type}")
 
 
+def parse_three_floats(text: str) -> Tuple[float, float, float]:
+    vals = [float(v.strip()) for v in text.split(",")]
+    if len(vals) != 3:
+        raise ValueError("Expected three comma-separated floats.")
+    return vals[0], vals[1], vals[2]
+
+
 @torch.no_grad()
-def regression_metrics(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    periodic_phi_loss: bool = False,
-    phi_period: float = 2.0 * math.pi,
-) -> Dict[str, float]:
-    diff = pred - target
-    if periodic_phi_loss:
-        diff = diff.clone()
-        diff[2] = wrapped_angle_diff(pred[2], target[2], period=phi_period)
+def compute_metric_components(pred_metric: torch.Tensor, target_metric: torch.Tensor, phi_period: float) -> Dict[str, torch.Tensor]:
+    diff = pred_metric - target_metric
+    diff = diff.clone()
+    diff[2] = wrapped_angle_diff(pred_metric[2], target_metric[2], period=phi_period)
 
     abs_err = diff.abs()
-    sq_err = diff ** 2
-    mae_ptq = float(abs_err[0].item())
-    mae_eta = float(abs_err[1].item())
-    mae_phi = float(abs_err[2].item())
+    sq_err = diff.pow(2)
 
-    rmse_ptq = float(torch.sqrt(sq_err[0]).item())
-    rmse_eta = float(torch.sqrt(sq_err[1]).item())
-    rmse_phi = float(torch.sqrt(sq_err[2]).item())
+    pt_target = target_metric[0].abs().clamp(min=1e-6)
+    pt_mape = 100.0 * abs_err[0] / pt_target
 
-    mae_mean = float(abs_err.mean().item())
-    rmse_mean = float(torch.sqrt(sq_err.mean()).item())
+    smape = 200.0 * abs_err / (pred_metric.abs() + target_metric.abs()).clamp(min=1e-6)
 
     return {
-        "mae_ptq": mae_ptq,
-        "mae_eta": mae_eta,
-        "mae_phi": mae_phi,
-        "rmse_ptq": rmse_ptq,
-        "rmse_eta": rmse_eta,
-        "rmse_phi": rmse_phi,
-        "mae_mean": mae_mean,
-        "rmse_mean": rmse_mean,
+        "abs_err": abs_err.to(torch.float64),
+        "sq_err": sq_err.to(torch.float64),
+        "smape": smape.to(torch.float64),
+        "pt_mape": pt_mape.to(torch.float64),
     }
-    
-@torch.no_grad()
-def regression_mape_metrics(
-    pred: torch.Tensor,
-    target: torch.Tensor,
+
+
+def build_train_targets(
+    y: torch.Tensor,
+    target_center_2: torch.Tensor,
+    target_scale_2: torch.Tensor,
+    phi_mode: str,
+) -> Dict[str, torch.Tensor]:
+    out = {
+        "pt": (y[0] - target_center_2[0]) / target_scale_2[0],
+        "eta": (y[1] - target_center_2[1]) / target_scale_2[1],
+    }
+    phi = y[2]
+    if phi_mode == "sincos":
+        out["phi_target"] = torch.stack([torch.sin(phi), torch.cos(phi)], dim=0)
+    elif phi_mode == "scalar":
+        out["phi_target"] = phi
+    else:
+        raise ValueError(f"Unsupported phi_mode={phi_mode}")
+    return out
+
+
+def decode_prediction_to_metric(
+    pred_dict: Dict[str, torch.Tensor],
+    target_center_2: torch.Tensor,
+    target_scale_2: torch.Tensor,
+    phi_mode: str,
+) -> torch.Tensor:
+    pt = pred_dict["pt"] * target_scale_2[0] + target_center_2[0]
+    eta = pred_dict["eta"] * target_scale_2[1] + target_center_2[1]
+    if phi_mode == "sincos":
+        phi = angle_from_sincos(pred_dict["phi_raw"])
+    else:
+        phi = pred_dict["phi_raw"].reshape(-1)[0]
+    return torch.stack([pt, eta, phi], dim=0)
+
+
+def compute_total_loss(
+    pred_dict: Dict[str, torch.Tensor],
+    y: torch.Tensor,
+    target_center_2: torch.Tensor,
+    target_scale_2: torch.Tensor,
     *,
-    periodic_phi_loss: bool = False,
-    phi_period: float = 2.0 * math.pi,
-    mape_eps: float = 1e-6,
-) -> Dict[str, float]:
-    """
-    Mean absolute percentage error per target component, in percent.
-    Uses |target| clamped by mape_eps in the denominator to avoid division by zero.
-    """
-    diff = pred - target
-    if periodic_phi_loss:
-        diff = diff.clone()
-        diff[2] = wrapped_angle_diff(pred[2], target[2], period=phi_period)
+    loss_type: str,
+    phi_mode: str,
+    phi_vec_weight: float,
+    target_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    t = build_train_targets(y, target_center_2, target_scale_2, phi_mode)
 
-    denom = torch.clamp(target.abs(), min=float(mape_eps))
-    ape = (diff.abs() / denom) * 100.0
+    pt_loss = component_regression_loss(pred_dict["pt"] - t["pt"], loss_type=loss_type).mean()
+    eta_loss = component_regression_loss(pred_dict["eta"] - t["eta"], loss_type=loss_type).mean()
 
-    mape_ptq = float(ape[0].item())
-    mape_eta = float(ape[1].item())
-    mape_phi = float(ape[2].item())
-    mape_mean = float(ape.mean().item())
+    if phi_mode == "sincos":
+        phi_pred = F.normalize(pred_dict["phi_raw"], dim=0)
+        phi_loss_vec = component_regression_loss(phi_pred - t["phi_target"], loss_type=loss_type)
+        phi_loss = phi_vec_weight * phi_loss_vec.mean()
+    else:
+        diff_phi = wrapped_angle_diff(pred_dict["phi_raw"].reshape(-1)[0], t["phi_target"], period=2.0 * math.pi)
+        phi_loss = component_regression_loss(diff_phi, loss_type=loss_type).mean()
 
-    return {
-        "mape_ptq": mape_ptq,
-        "mape_eta": mape_eta,
-        "mape_phi": mape_phi,
-        "mape_mean": mape_mean,
+    total = target_weights[0] * pt_loss + target_weights[1] * eta_loss + target_weights[2] * phi_loss
+    pieces = {
+        "loss_pt": pt_loss.detach(),
+        "loss_eta": eta_loss.detach(),
+        "loss_phi": phi_loss.detach(),
     }
+    return total, pieces
 
-    
+
 def infer_dims_from_subset(subset) -> Tuple[int, int, int]:
-    """
-    Infer x / edge_attr / y dims directly from the dataset item,
-    without creating a DataLoader iterator. This avoids leaving an
-    extra persistent-worker iterator and prefetched batches alive.
-    """
     sample = subset[0]
     xdim = int(sample["x"].shape[1])
     edim = int(sample["edge_attr"].shape[1])
@@ -1208,33 +1209,6 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
     return out
 
 
-@torch.no_grad()
-def probe_graph_on_device(
-    model: nn.Module,
-    batch: Dict[str, Any],
-    device: torch.device,
-    *,
-    edge_dropout_p: float = 0.0,
-    use_amp: bool = False,
-    amp_dtype: torch.dtype = torch.bfloat16,
-) -> None:
-    """
-    Run a minimal forward pass for a single graph to determine whether it is
-    intrinsically toxic on this device/process. Raises on failure.
-    """
-    model.eval()
-    b = move_batch_to_device(batch, device)
-    x = b["x"]
-    edge_index = b["edge_index"]
-    edge_attr = b["edge_attr"]
-    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
-        out = model(x, edge_index, edge_attr, edge_dropout_p=edge_dropout_p)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    if not torch.isfinite(out).all():
-        raise RuntimeError(f"Non-finite model output during probe for {_batch_id_string(batch)}")
-
-
 def quarantine_bad_batch(
     batch: Dict[str, Any],
     exc: Exception,
@@ -1243,10 +1217,6 @@ def quarantine_bad_batch(
     quarantine_file: str,
     skip_bad_graphs: bool,
 ) -> bool:
-    """
-    Returns True if caller should skip the sample and continue training.
-    Returns False if caller should re-raise and terminate.
-    """
     bid = _batch_id_string(batch)
     payload = {
         "graph_id": bid,
@@ -1283,7 +1253,7 @@ def fail_fast_bad_batch(batch: Dict[str, Any], exc: Exception, where: str) -> No
 
 
 # ----------------------------
-# Train
+# Main
 # ----------------------------
 
 def main():
@@ -1305,21 +1275,16 @@ def main():
     ap.add_argument("--graph-pool", default="meanmax", choices=["mean", "max", "meanmax"])
 
     ap.add_argument("--loss-type", default="smoothl1", choices=["smoothl1", "mse", "l1"])
-    ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="none",
-                    help="Scale regression targets before loss computation. Use 'robust' if target components have very different ranges or outliers.")
-    ap.add_argument("--target-scale-eps", type=float, default=1e-6,
-                    help="Numerical epsilon for target scaling.")
+    ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="robust")
+    ap.add_argument("--target-scale-eps", type=float, default=1e-6)
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
 
-    ap.add_argument("--periodic-phi-loss", action="store_true", default=False,
-                    help="Use shortest wrapped angular difference for the phi target in loss and metrics.")
-    ap.add_argument("--no-periodic-phi-loss", dest="periodic_phi_loss", action="store_false")
-    ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi),
-                    help="Period used for wrapped phi differences. Default is 2*pi.")
-    ap.add_argument("--mape-eps", type=float, default=1e-6,
-                    help="Minimum |target| used in the MAPE denominator to avoid division by zero.")
+    ap.add_argument("--phi-mode", default="sincos", choices=["sincos", "scalar"], help="Use sin/cos head for phi by default.")
+    ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi))
+    ap.add_argument("--phi-vec-weight", type=float, default=1.0, help="Extra multiplier for the sin/cos phi loss.")
+    ap.add_argument("--target-loss-weights", default="1.0,1.0,1.0", help="Weights for pt_over_q, eta, phi losses.")
 
-    ap.add_argument("--save", default="track_graph_regressor.pt")
+    ap.add_argument("--save", default="track_graph_regressor_v2.pt")
     ap.add_argument("--seed", type=int, default=12345)
 
     ap.add_argument("--time", action="store_true", default=True)
@@ -1378,14 +1343,10 @@ def main():
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--save-dir", default=None)
     ap.add_argument("--resume", dest="resume", action="store_true", default=False)
-    ap.add_argument("--skip-bad-graphs", action="store_true", default=True,
-                    help="Skip graphs that deterministically trigger CUDA/runtime failures and log them.")
-    ap.add_argument("--no-skip-bad-graphs", dest="skip_bad_graphs", action="store_false")
-    ap.add_argument("--bad-graphs-file", default="bad_graphs.jsonl",
-                    help="JSONL log of quarantined graph samples.")
-    ap.add_argument("--debug-sync", action="store_true", default=False,
-                    help="Synchronize after backward/step too, for more precise fault attribution.")
     ap.add_argument("--no-resume", dest="resume", action="store_false")
+    ap.add_argument("--skip-bad-graphs", action="store_true", default=True)
+    ap.add_argument("--no-skip-bad-graphs", dest="skip_bad_graphs", action="store_false")
+    ap.add_argument("--bad-graphs-file", default="bad_graphs.jsonl")
     ap.add_argument("--code-version", default=None)
 
     args = ap.parse_args()
@@ -1505,6 +1466,7 @@ def main():
         fourier_min_exp=args.fourier_min_exp,
         fourier_max_exp=args.fourier_max_exp,
         graph_pool=args.graph_pool,
+        phi_mode=args.phi_mode,
     ).to(device)
 
     if ddp_is_initialized():
@@ -1541,8 +1503,8 @@ def main():
     use_amp = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
-    
-    target_center, target_scale = estimate_target_transform(
+
+    target_center_2, target_scale_2 = estimate_target_transform(
         train_ds,
         device=device,
         mode=args.target_scale,
@@ -1550,12 +1512,15 @@ def main():
         eps=args.target_scale_eps,
     )
     ds._close_files()
-    
+
+    target_weights = torch.tensor(parse_three_floats(args.target_loss_weights), device=device, dtype=torch.float32)
+
     if ddp_is_main():
         print(f"[i] target_scale_mode={args.target_scale}", flush=True)
-        print(f"[i] target_center={target_center.detach().cpu().numpy()}  # [pt_over_q, eta, phi]", flush=True)
-        print(f"[i] target_scale ={target_scale.detach().cpu().numpy()}  # [pt_over_q, eta, phi]", flush=True)
-        print(f"[i] periodic_phi_loss={args.periodic_phi_loss} phi_period={args.phi_period}", flush=True)
+        print(f"[i] target_center_linear={target_center_2.detach().cpu().numpy()}  # [pt_over_q, eta]", flush=True)
+        print(f"[i] target_scale_linear ={target_scale_2.detach().cpu().numpy()}  # [pt_over_q, eta]", flush=True)
+        print(f"[i] phi_mode={args.phi_mode} phi_period={args.phi_period}", flush=True)
+        print(f"[i] target_loss_weights={target_weights.detach().cpu().tolist()}", flush=True)
 
     loader_kwargs = {
         "collate_fn": collate_one,
@@ -1569,8 +1534,6 @@ def main():
             prefetch_factor=args.prefetch_factor,
         )
 
-    # Avoid pin_memory_device here. It is not needed for this workload and can
-    # increase pinned-host-memory pressure on some systems.
     train_loader = DataLoader(
         train_ds,
         batch_size=1,
@@ -1595,7 +1558,7 @@ def main():
             raise RuntimeError(
                 f"DDP validation has 0 batches per rank (val_ds={len(val_ds)} world_size={ddp_world_size()})."
             )
-            
+
     steps_per_epoch = len(train_loader)
     scheduler = build_scheduler(opt, args, steps_per_epoch=steps_per_epoch)
 
@@ -1607,21 +1570,20 @@ def main():
         if args.wandb_key is not None:
             os.environ["WANDB_API_KEY"] = args.wandb_key
         os.environ["WANDB_MODE"] = args.wandb_mode
+        cfg = {
+            **vars(args),
+            "target_center_linear": target_center_2.detach().cpu().tolist(),
+            "target_scale_linear": target_scale_2.detach().cpu().tolist(),
+            "target_labels": ["pt_like", "eta", "phi"],
+            "xdim": xdim,
+            "edim": edim,
+        }
         try:
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_name,
                 dir=args.wandb_dir,
-                config={
-                    **vars(args),
-                    "target_center": target_center.detach().cpu().tolist(),
-                    "target_scale_values": target_scale.detach().cpu().tolist(),
-                    "target_labels": ["pt_over_q", "eta", "phi"],
-                    "xdim": xdim,
-                    "periodic_phi_loss": args.periodic_phi_loss,
-                    "phi_period": args.phi_period,
-                    "edim": edim,
-                },
+                config=cfg,
             )
         except Exception as e:
             print(f"[wandb] init failed ({type(e).__name__}: {e}). Falling back to offline.")
@@ -1630,16 +1592,7 @@ def main():
                 project=args.wandb_project,
                 name=args.wandb_name,
                 dir=args.wandb_dir,
-                config={
-                    **vars(args),
-                    "target_center": target_center.detach().cpu().tolist(),
-                    "target_scale_values": target_scale.detach().cpu().tolist(),
-                    "target_labels": ["pt_over_q", "eta", "phi"],
-                    "xdim": xdim,
-                    "periodic_phi_loss": args.periodic_phi_loss,
-                    "phi_period": args.phi_period,
-                    "edim": edim,
-                },
+                config=cfg,
             )
 
     save_path = _build_save_path(args, run_id)
@@ -1685,14 +1638,14 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # ---- train ----
         model.train()
         train_loss = torch.tensor(0.0, device=device)
         train_steps = torch.tensor(0.0, device=device)
-
+        train_loss_parts = torch.zeros(3, device=device, dtype=torch.float64)
         train_abs_err = torch.zeros(3, device=device, dtype=torch.float64)
         train_sq_err = torch.zeros(3, device=device, dtype=torch.float64)
-        train_ape_sum = torch.zeros(3, device=device, dtype=torch.float64)
+        train_smape_sum = torch.zeros(3, device=device, dtype=torch.float64)
+        train_pt_mape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
 
         with timed_section("train_epoch_total", device, enabled=args.time):
             for batch in train_loader:
@@ -1703,16 +1656,10 @@ def main():
                     edge_index = batch["edge_index"]
                     edge_attr = batch["edge_attr"]
                     y = batch["y_track"].float()
-
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                 except Exception as e:
-                    if quarantine_bad_batch(
-                        batch, e,
-                        where="train/load_or_h2d",
-                        quarantine_file=args.bad_graphs_file,
-                        skip_bad_graphs=args.skip_bad_graphs,
-                    ):
+                    if quarantine_bad_batch(batch, e, where="train/load_or_h2d", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
                         continue
@@ -1724,181 +1671,98 @@ def main():
                 batch_id = _batch_id_string(batch)
                 if not torch.isfinite(x).all():
                     e = RuntimeError(f"Non-finite x after augmentation for {batch_id}")
-                    if quarantine_bad_batch(
-                        batch, e,
-                        where="train/post_aug",
-                        quarantine_file=args.bad_graphs_file,
-                        skip_bad_graphs=args.skip_bad_graphs,
-                    ):
+                    if quarantine_bad_batch(batch, e, where="train/post_aug", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
                         continue
                     raise e
-                
-                y_train = (y - target_center) / target_scale
 
                 opt.zero_grad(set_to_none=True)
                 try:
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
-                        loss = regression_loss(
-                            pred,
-                            y_train,
+                        pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
+                        loss, pieces = compute_total_loss(
+                            pred_dict,
+                            y,
+                            target_center_2,
+                            target_scale_2,
                             loss_type=args.loss_type,
-                            periodic_phi_loss=args.periodic_phi_loss,
-                            phi_period=(args.phi_period / float(target_scale[2].item())),
+                            phi_mode=args.phi_mode,
+                            phi_vec_weight=args.phi_vec_weight,
+                            target_weights=target_weights,
                         )
-                        
-                    if not torch.isfinite(pred).all():
-                        raise RuntimeError(f"Non-finite pred for {batch_id}")
+
                     if not torch.isfinite(loss):
-                        raise RuntimeError(f"Non-finite loss for {batch_id}")                                                
-                        
+                        raise RuntimeError(f"Non-finite loss for {batch_id}")
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                 except Exception as e:
-                    if quarantine_bad_batch(
-                        batch, e,
-                        where="train/forward",
-                        quarantine_file=args.bad_graphs_file,
-                        skip_bad_graphs=args.skip_bad_graphs,
-                    ):
-                        try:
-                            if device.type == "cuda":
-                                torch.cuda.empty_cache()
-                        except Exception:
-                            pass
+                    if quarantine_bad_batch(batch, e, where="train/forward", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         continue
                     fail_fast_bad_batch(batch, e, where="train/forward")
 
                 if scaler.is_enabled():
-                    try:
-                        scaler.scale(loss).backward()
-                        if args.debug_sync and device.type == "cuda":
-                            torch.cuda.synchronize(device)
-                    except Exception as e:
-                        if quarantine_bad_batch(
-                            batch, e,
-                            where="train/backward",
-                            quarantine_file=args.bad_graphs_file,
-                            skip_bad_graphs=args.skip_bad_graphs,
-                        ):
-                            opt.zero_grad(set_to_none=True)
-                            continue
-                        fail_fast_bad_batch(batch, e, where="train/backward")
+                    scaler.scale(loss).backward()
                     scaler.unscale_(opt)
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                    try:
-                        scaler.step(opt)
-                        if args.debug_sync and device.type == "cuda":
-                            torch.cuda.synchronize(device)
-                    except Exception as e:
-                        if quarantine_bad_batch(
-                            batch, e,
-                            where="train/optimizer_step",
-                            quarantine_file=args.bad_graphs_file,
-                            skip_bad_graphs=args.skip_bad_graphs,
-                        ):
-                            opt.zero_grad(set_to_none=True)
-                            continue
-                        fail_fast_bad_batch(batch, e, where="train/optimizer_step")
+                    scaler.step(opt)
                     scaler.update()
                 else:
-                    try:
-                        loss.backward()
-                        if args.debug_sync and device.type == "cuda":
-                            torch.cuda.synchronize(device)
-                    except Exception as e:
-                        if quarantine_bad_batch(
-                            batch, e,
-                            where="train/backward",
-                            quarantine_file=args.bad_graphs_file,
-                            skip_bad_graphs=args.skip_bad_graphs,
-                        ):
-                            opt.zero_grad(set_to_none=True)
-                            continue
-                        fail_fast_bad_batch(batch, e, where="train/backward")
-
+                    loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                    try:
-                        opt.step()
-                        if args.debug_sync and device.type == "cuda":
-                            torch.cuda.synchronize(device)
-                    except Exception as e:
-                        if quarantine_bad_batch(
-                            batch, e,
-                            where="train/optimizer_step",
-                            quarantine_file=args.bad_graphs_file,
-                            skip_bad_graphs=args.skip_bad_graphs,
-                        ):
-                            opt.zero_grad(set_to_none=True)
-                            continue
-                        fail_fast_bad_batch(batch, e, where="train/optimizer_step")
+                    opt.step()
 
                 if ema is not None:
                     ema.update(model)
-
                 if args.lr_schedule == "cosine":
                     scheduler.step()
 
                 train_loss += loss.detach()
                 train_steps += 1.0
+                train_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
 
-                pred_metric = pred.detach() * target_scale + target_center
-                diff_metric = pred_metric - y
-                if args.periodic_phi_loss:
-                    diff_metric = diff_metric.clone()
-                    diff_metric[2] = wrapped_angle_diff(pred_metric[2], y[2], period=args.phi_period)
-                    
-                denom_metric = torch.clamp(y.abs(), min=float(args.mape_eps))
-                ape_metric = (diff_metric.abs() / denom_metric).to(torch.float64) * 100.0
-                abs_err = diff_metric.abs().to(torch.float64)
-                sq_err = (diff_metric ** 2).to(torch.float64)
-                train_abs_err += abs_err
-                train_sq_err += sq_err
-                train_ape_sum += ape_metric
-                
-                # Opportunistically probe the exact graph on failure-prone setups once it has passed.
-                # This keeps a single toxic sample from repeatedly killing later epochs.
-                if args.debug_sync and device.type == "cuda":
-                    try:
-                        probe_graph_on_device(model, batch, device, edge_dropout_p=0.0, use_amp=False, amp_dtype=amp_dtype)
-                    except Exception as e:
-                        if quarantine_bad_batch(batch, e, where="train/probe", quarantine_file=args.bad_graphs_file, skip_bad_graphs=True):
-                            continue
-                        raise
-                
-                del x, edge_index, edge_attr, y, y_train, pred, loss, pred_metric, diff_metric, denom_metric, ape_metric, abs_err, sq_err
-                
+                pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
+                metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
+                train_abs_err += metric_parts["abs_err"]
+                train_sq_err += metric_parts["sq_err"]
+                train_smape_sum += metric_parts["smape"]
+                train_pt_mape_sum += metric_parts["pt_mape"]
+
+                del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
+
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
         ddp_all_reduce_sum(train_loss)
         ddp_all_reduce_sum(train_steps)
-        ddp_all_reduce_sum(train_ape_sum)
+        ddp_all_reduce_sum(train_loss_parts)
         ddp_all_reduce_sum(train_abs_err)
         ddp_all_reduce_sum(train_sq_err)
+        ddp_all_reduce_sum(train_smape_sum)
+        ddp_all_reduce_sum(train_pt_mape_sum)
 
         train_loss_mean = (train_loss / torch.clamp(train_steps, min=1.0)).item()
+        train_loss_parts_mean = (train_loss_parts / torch.clamp(train_steps, min=1.0)).cpu().numpy()
         train_mae = (train_abs_err / torch.clamp(train_steps, min=1.0)).cpu().numpy()
         train_rmse = torch.sqrt(train_sq_err / torch.clamp(train_steps, min=1.0)).cpu().numpy()
-        train_mae_mean = float(np.mean(train_mae))
-        train_mape = (train_ape_sum / torch.clamp(train_steps, min=1.0)).cpu().numpy()
-        train_mape_mean = float(np.mean(train_mape))
+        train_smape = (train_smape_sum / torch.clamp(train_steps, min=1.0)).cpu().numpy()
+        train_pt_mape = (train_pt_mape_sum / torch.clamp(train_steps, min=1.0)).item()
         train_rmse_mean = float(np.mean(train_rmse))
 
-        # ---- val ----
         model.eval()
         val_loss = torch.tensor(0.0, device=device)
         val_steps = torch.tensor(0.0, device=device)
+        val_loss_parts = torch.zeros(3, device=device, dtype=torch.float64)
         val_abs_err = torch.zeros(3, device=device, dtype=torch.float64)
-        val_ape_sum = torch.zeros(3, device=device, dtype=torch.float64)
         val_sq_err = torch.zeros(3, device=device, dtype=torch.float64)
+        val_smape_sum = torch.zeros(3, device=device, dtype=torch.float64)
+        val_pt_mape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
 
         eval_ctx = ema.apply_to(model) if ema is not None else nullcontext()
         with eval_ctx:
             with torch.no_grad():
                 for batch in val_loader:
-                    batch_id = _batch_id_string(batch)
                     try:
                         validate_graph_batch(batch, where="val/cpu")
                         batch = move_batch_to_device(batch, device)
@@ -1909,54 +1773,40 @@ def main():
                         if device.type == "cuda":
                             torch.cuda.synchronize(device)
                     except Exception as e:
-                        if quarantine_bad_batch(
-                            batch, e,
-                            where="val/load_or_h2d",
-                            quarantine_file=args.bad_graphs_file,
-                            skip_bad_graphs=args.skip_bad_graphs,
-                        ):
+                        if quarantine_bad_batch(batch, e, where="val/load_or_h2d", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
                             continue
                         fail_fast_bad_batch(batch, e, where="val/load_or_h2d")
-                    
-                    y_eval = (y - target_center) / target_scale
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
-                        loss = regression_loss(
-                            pred,
-                            y_eval,
+                        pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
+                        loss, pieces = compute_total_loss(
+                            pred_dict,
+                            y,
+                            target_center_2,
+                            target_scale_2,
                             loss_type=args.loss_type,
-                            periodic_phi_loss=args.periodic_phi_loss,
-                            phi_period=(args.phi_period / float(target_scale[2].item())),
+                            phi_mode=args.phi_mode,
+                            phi_vec_weight=args.phi_vec_weight,
+                            target_weights=target_weights,
                         )
 
-                    if not torch.isfinite(pred).all():
-                        raise RuntimeError(f"Non-finite val pred for {batch_id}")
                     if not torch.isfinite(loss):
-                        raise RuntimeError(f"Non-finite val loss for {batch_id}")
-                        
+                        raise RuntimeError(f"Non-finite val loss for {_batch_id_string(batch)}")
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
-                        
-                    pred_metric = pred * target_scale + target_center
+
+                    pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
+                    metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
+
                     val_loss += loss.detach()
                     val_steps += 1.0
+                    val_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+                    val_abs_err += metric_parts["abs_err"]
+                    val_sq_err += metric_parts["sq_err"]
+                    val_smape_sum += metric_parts["smape"]
+                    val_pt_mape_sum += metric_parts["pt_mape"]
 
-                    diff_metric = pred_metric - y
-                    if args.periodic_phi_loss:
-                        diff_metric = diff_metric.clone()
-                        diff_metric[2] = wrapped_angle_diff(pred_metric[2], y[2], period=args.phi_period)
-                        
-                    denom_metric = torch.clamp(y.abs(), min=float(args.mape_eps))
-                    ape_metric = (diff_metric.abs() / denom_metric).to(torch.float64) * 100.0
-
-                    abs_err = diff_metric.abs().to(torch.float64)
-                    sq_err = (diff_metric ** 2).to(torch.float64)
-                    val_ape_sum += ape_metric
-                    val_abs_err += abs_err
-                    val_sq_err += sq_err
-                    
-                    del x, edge_index, edge_attr, y, y_eval, pred, loss, pred_metric, diff_metric, denom_metric, ape_metric, abs_err, sq_err
+                    del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
 
         gc.collect()
         if device.type == "cuda":
@@ -1964,16 +1814,18 @@ def main():
 
         ddp_all_reduce_sum(val_loss)
         ddp_all_reduce_sum(val_steps)
-        ddp_all_reduce_sum(val_ape_sum)
+        ddp_all_reduce_sum(val_loss_parts)
         ddp_all_reduce_sum(val_abs_err)
         ddp_all_reduce_sum(val_sq_err)
+        ddp_all_reduce_sum(val_smape_sum)
+        ddp_all_reduce_sum(val_pt_mape_sum)
 
         val_loss_mean = (val_loss / torch.clamp(val_steps, min=1.0)).item()
+        val_loss_parts_mean = (val_loss_parts / torch.clamp(val_steps, min=1.0)).cpu().numpy()
         val_mae = (val_abs_err / torch.clamp(val_steps, min=1.0)).cpu().numpy()
         val_rmse = torch.sqrt(val_sq_err / torch.clamp(val_steps, min=1.0)).cpu().numpy()
-        val_mae_mean = float(np.mean(val_mae))
-        val_mape = (val_ape_sum / torch.clamp(val_steps, min=1.0)).cpu().numpy()
-        val_mape_mean = float(np.mean(val_mape))
+        val_smape = (val_smape_sum / torch.clamp(val_steps, min=1.0)).cpu().numpy()
+        val_pt_mape = (val_pt_mape_sum / torch.clamp(val_steps, min=1.0)).item()
         val_rmse_mean = float(np.mean(val_rmse))
 
         if args.lr_schedule == "plateau":
@@ -1981,19 +1833,18 @@ def main():
         current_lr = opt.param_groups[0]["lr"]
 
         monitor_val = val_loss_mean if args.early_stop_monitor == "val_loss" else val_rmse_mean
-        improved = (
-            best_monitor is None or
-            monitor_val < best_monitor - args.early_stop_min_delta
-        )
+        improved = best_monitor is None or monitor_val < best_monitor - args.early_stop_min_delta
 
         if ddp_is_main():
             print(
                 f"[epoch {epoch:03d}] "
-                f"train loss={train_loss_mean:.5f} mae=({train_mae[0]:.4f},{train_mae[1]:.4f},{train_mae[2]:.4f}) "
-                f"mape=({train_mape[0]:.2f}%,{train_mape[1]:.2f}%,{train_mape[2]:.2f}%) "
+                f"train loss={train_loss_mean:.5f} parts=({train_loss_parts_mean[0]:.5f},{train_loss_parts_mean[1]:.5f},{train_loss_parts_mean[2]:.5f}) "
+                f"mae=({train_mae[0]:.4f},{train_mae[1]:.4f},{train_mae[2]:.4f}) "
+                f"smape=({train_smape[0]:.2f}%,{train_smape[1]:.2f}%,{train_smape[2]:.2f}%) pt_over_q_mape={train_pt_mape:.2f}% "
                 f"rmse_mean={train_rmse_mean:.4f} | "
-                f"val loss={val_loss_mean:.5f} mae=({val_mae[0]:.4f},{val_mae[1]:.4f},{val_mae[2]:.4f}) "
-                f"mape=({val_mape[0]:.2f}%,{val_mape[1]:.2f}%,{val_mape[2]:.2f}%) "
+                f"val loss={val_loss_mean:.5f} parts=({val_loss_parts_mean[0]:.5f},{val_loss_parts_mean[1]:.5f},{val_loss_parts_mean[2]:.5f}) "
+                f"mae=({val_mae[0]:.4f},{val_mae[1]:.4f},{val_mae[2]:.4f}) "
+                f"smape=({val_smape[0]:.2f}%,{val_smape[1]:.2f}%,{val_smape[2]:.2f}%) pt_over_q_mape={val_pt_mape:.2f}% "
                 f"rmse_mean={val_rmse_mean:.4f} | "
                 f"lr={current_lr:.3e} | "
                 f"{args.early_stop_monitor}={monitor_val:.6f} {'(best)' if improved else ''}"
@@ -2004,28 +1855,32 @@ def main():
                 {
                     "epoch": epoch,
                     "train/loss": train_loss_mean,
-                    "train/mae_ptq": float(train_mae[0]),
+                    "train/loss_pt_over_q": float(train_loss_parts_mean[0]),
+                    "train/loss_eta": float(train_loss_parts_mean[1]),
+                    "train/loss_phi": float(train_loss_parts_mean[2]),
+                    "train/mae_pt_over_q": float(train_mae[0]),
                     "train/mae_eta": float(train_mae[1]),
                     "train/mae_phi": float(train_mae[2]),
-                    "train/mae_mean": train_mae_mean,
-                    "train/mape_ptq": float(train_mape[0]),
-                    "train/mape_eta": float(train_mape[1]),
-                    "train/mape_phi": float(train_mape[2]),
-                    "train/mape_mean": train_mape_mean,
-                    "train/rmse_ptq": float(train_rmse[0]),
+                    "train/smape_pt_over_q": float(train_smape[0]),
+                    "train/smape_eta": float(train_smape[1]),
+                    "train/smape_phi": float(train_smape[2]),
+                    "train/pt_over_q_mape": float(train_pt_mape),
+                    "train/rmse_pt_over_q": float(train_rmse[0]),
                     "train/rmse_eta": float(train_rmse[1]),
                     "train/rmse_phi": float(train_rmse[2]),
                     "train/rmse_mean": train_rmse_mean,
                     "val/loss": val_loss_mean,
-                    "val/mae_ptq": float(val_mae[0]),
+                    "val/loss_pt_over_q": float(val_loss_parts_mean[0]),
+                    "val/loss_eta": float(val_loss_parts_mean[1]),
+                    "val/loss_phi": float(val_loss_parts_mean[2]),
+                    "val/mae_pt_over_q": float(val_mae[0]),
                     "val/mae_eta": float(val_mae[1]),
                     "val/mae_phi": float(val_mae[2]),
-                    "val/mae_mean": val_mae_mean,
-                    "val/mape_ptq": float(val_mape[0]),
-                    "val/mape_eta": float(val_mape[1]),
-                    "val/mape_phi": float(val_mape[2]),
-                    "val/mape_mean": val_mape_mean,
-                    "val/rmse_ptq": float(val_rmse[0]),
+                    "val/smape_pt_over_q": float(val_smape[0]),
+                    "val/smape_eta": float(val_smape[1]),
+                    "val/smape_phi": float(val_smape[2]),
+                    "val/pt_over_q_mape": float(val_pt_mape),
+                    "val/rmse_pt_over_q": float(val_rmse[0]),
                     "val/rmse_eta": float(val_rmse[1]),
                     "val/rmse_phi": float(val_rmse[2]),
                     "val/rmse_mean": val_rmse_mean,
@@ -2062,10 +1917,11 @@ def main():
                     "fourier_max_exp": args.fourier_max_exp,
                     "target_scale_mode": args.target_scale,
                     "target_scale_eps": args.target_scale_eps,
-                    "target_center": target_center.detach().cpu(),
-                    "target_scale": target_scale.detach().cpu(),
-                    "periodic_phi_loss": args.periodic_phi_loss,
+                    "target_center_linear": target_center_2.detach().cpu(),
+                    "target_scale_linear": target_scale_2.detach().cpu(),
+                    "phi_mode": args.phi_mode,
                     "phi_period": args.phi_period,
+                    "target_loss_weights": target_weights.detach().cpu(),
                     "best_monitor": best_monitor,
                     "early_stop_monitor": args.early_stop_monitor,
                     "best_ckpt_epoch": best_ckpt_epoch,

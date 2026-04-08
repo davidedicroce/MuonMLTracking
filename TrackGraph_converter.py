@@ -25,12 +25,12 @@ Pipeline
 Example
 -------
 python -u TrackGraph_converter.py \
-  --input-dir /eos/project-f/fcc-ml/ddicroce/ATLAS_MuonSpectrometer/MuonBucketClassifier/data_pu0_gsegments \
+  --input-dir /eos/project-f/fcc-ml/ddicroce/ATLAS_MuonSpectrometer/data/data_pu0_gsegments \
   --pattern "MuonSegmentDump_*.root" \
   --onnx-path ../MuonSegmentClassifier/onnx_eval_mpnn/best_segment_classifier_mpnn.onnx \
   --output-dir ./data \
   --output-name track_graphs_pu0 \
-  --edge-score-threshold 0.5
+  --edge-score-threshold 0.5 2>&1 | tee log_converter.txt
 """
 
 import argparse
@@ -479,7 +479,12 @@ def majority_truth_for_branch(node_ids, has_truth, truth_id, truth_pt, truth_eta
     else:
         return None
     
+    # Target uses pt/q
+    pt_vals = pt_vals[np.abs(pt_vals) > 0]
+    if pt_vals.size == 0:
+        return None
     pt_over_q_vals = pt_vals / charge
+    pt_over_q_vals /= 1000.0  # MeV -> GeV
 
     target = np.asarray(
         [
