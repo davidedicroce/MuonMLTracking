@@ -1886,6 +1886,7 @@ def main():
     reloaded_this_plateau = False
 
     for epoch in range(int(start_epoch), args.epochs + 1):
+        epoch_start = time.perf_counter()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -2123,6 +2124,7 @@ def main():
         if args.lr_schedule == "plateau":
             scheduler.step(val_loss_mean)
         current_lr = opt.param_groups[0]["lr"]
+        epoch_seconds = time.perf_counter() - epoch_start
 
         monitor_val = val_loss_mean if args.early_stop_monitor == "val_loss" else val_rmse_mean
         improved = best_monitor is None or monitor_val < best_monitor - args.early_stop_min_delta
@@ -2139,6 +2141,7 @@ def main():
                 f"smape=({val_smape[0]:.2f}%,{val_smape[1]:.2f}%,{val_smape[2]:.2f}%) ptq_mape={val_pt_mape:.2f}% "
                 f"rmse_mean={val_rmse_mean:.4f} | "
                 f"lr={current_lr:.3e} | "
+                f"epoch_time={epoch_seconds:.2f}s | "
                 f"{args.early_stop_monitor}={monitor_val:.6f} {'(best)' if improved else ''}"
             )
 
@@ -2177,6 +2180,7 @@ def main():
                     "val/rmse_phi": float(val_rmse[2]),
                     "val/rmse_mean": val_rmse_mean,
                     "lr": current_lr,
+                    "epoch_seconds": epoch_seconds,
                     args.early_stop_monitor: monitor_val,
                 },
                 step=epoch,
