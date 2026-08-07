@@ -1071,6 +1071,7 @@ def build_command(
     cmd += ["--phi-period", f"{float(args.phi_period):.12g}"]
     cmd += ["--phi-vec-weight", f"{float(hp['phi_vec_weight']):.8g}"]
     cmd += ["--graph-pool", str(hp["graph_pool"])]
+    cmd += ["--batch-size", str(int(args.batch_size))]
 
     # Layer family knobs
     cmd += ["--layer-type", str(hp["layer_type"])]
@@ -1682,6 +1683,8 @@ def main() -> None:
 
     # Dataloader/trainer controls
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=1,
+        help="Number of graphs to combine into one optimizer step for each DDP worker.")
     ap.add_argument("--pin-memory", action="store_true")
     ap.add_argument("--prefetch-factor", type=int, default=1, help="Lower values reduce /dev/shm pressure under many DDP jobs.")
     ap.add_argument("--persistent-workers", dest="persistent_workers", action="store_true", default=True)
