@@ -504,6 +504,14 @@ def collate_one(batch):
     return batch[0]
 
 
+def collate_batch(batch):
+    return batch
+
+
+def make_collate_fn(batch_size: int):
+    return collate_one if batch_size == 1 else collate_batch
+
+
 def h5_worker_init_fn(worker_id: int) -> None:
     # Stagger first HDF5 open/stat calls across DataLoader workers. This keeps
     # parallelism but avoids synchronized EOS metadata storms at worker startup.
@@ -1476,6 +1484,7 @@ def main():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--max-train-graphs", type=int, default=-1)
+    ap.add_argument("--batch-size", type=int, default=1, help="Number of graphs to combine into one optimizer step. Use 1 for one graph per batch.")
 
     ap.add_argument("--layer-type", default="mpnn", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"])
     ap.add_argument("--gat-heads", type=int, default=4)
@@ -1763,7 +1772,6 @@ def main():
         print(f"[i] target_loss_weights={target_weights.detach().cpu().tolist()}", flush=True)
 
     loader_kwargs = {
-        "collate_fn": collate_one,
         "num_workers": int(args.num_workers),
         "pin_memory": args.pin_memory,
     }
@@ -1777,16 +1785,18 @@ def main():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
+        collate_fn=make_collate_fn(args.batch_size),
         **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=False,
         sampler=val_sampler,
+        collate_fn=make_collate_fn(args.batch_size),
         **loader_kwargs,
     )
 
@@ -1890,66 +1900,110 @@ def main():
 
         with timed_section("train_epoch_total", device, enabled=args.time):
             for batch in train_loader:
-                try:
-                    validate_graph_batch(batch, where="train/cpu")
-                    batch = move_batch_to_device(batch, device)
-                    x = batch["x"]
-                    edge_index = batch["edge_index"]
-                    edge_attr = batch["edge_attr"]
-                    y = batch["y_track"].float()
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                except Exception as e:
-                    if quarantine_bad_batch(batch, e, where="train/load_or_h2d", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                        continue
-                    fail_fast_bad_batch(batch, e, where="train/load_or_h2d")
+                graphs = [batch] if isinstance(batch, dict) else list(batch)
+                if len(graphs) == 0:
+                    continue
 
-                if args.feat_noise_std > 0.0 and model.training:
-                    x = x + args.feat_noise_std * torch.randn_like(x)
-
-                batch_id = _batch_id_string(batch)
-                if not torch.isfinite(x).all():
-                    e = RuntimeError(f"Non-finite x after augmentation for {batch_id}")
-                    if quarantine_bad_batch(batch, e, where="train/post_aug", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
-                        continue
-                    raise e
-
+                total_loss = torch.tensor(0.0, device=device)
+                graphs_used = 0
                 opt.zero_grad(set_to_none=True)
-                try:
-                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
-                        loss, pieces = compute_total_loss(
-                            pred_dict,
-                            y,
-                            target_center_2,
-                            target_scale_2,
-                            loss_type=args.loss_type,
-                            phi_mode=args.phi_mode,
-                            phi_vec_weight=args.phi_vec_weight,
-                            target_weights=target_weights,
-                        )
 
-                    if not torch.isfinite(loss):
-                        raise RuntimeError(f"Non-finite loss for {batch_id}")
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                except Exception as e:
-                    if quarantine_bad_batch(batch, e, where="train/forward", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
+                for graph in graphs:
+                    try:
+                        validate_graph_batch(graph, where="train/cpu")
+                        graph = move_batch_to_device(graph, device)
+                        x = graph["x"]
+                        edge_index = graph["edge_index"]
+                        edge_attr = graph["edge_attr"]
+                        y = graph["y_track"].float()
                         if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                        continue
-                    fail_fast_bad_batch(batch, e, where="train/forward")
+                            torch.cuda.synchronize(device)
+                    except Exception as e:
+                        if quarantine_bad_batch(
+                            graph,
+                            e,
+                            where="train/load_or_h2d",
+                            quarantine_file=args.bad_graphs_file,
+                            skip_bad_graphs=args.skip_bad_graphs,
+                        ):
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                            continue
+                        fail_fast_bad_batch(graph, e, where="train/load_or_h2d")
 
+                    if args.feat_noise_std > 0.0 and model.training:
+                        x = x + args.feat_noise_std * torch.randn_like(x)
+
+                    batch_id = _batch_id_string(graph)
+                    if not torch.isfinite(x).all():
+                        e = RuntimeError(f"Non-finite x after augmentation for {batch_id}")
+                        if quarantine_bad_batch(
+                            graph,
+                            e,
+                            where="train/post_aug",
+                            quarantine_file=args.bad_graphs_file,
+                            skip_bad_graphs=args.skip_bad_graphs,
+                        ):
+                            continue
+                        raise e
+
+                    try:
+                        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                            pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
+                            loss, pieces = compute_total_loss(
+                                pred_dict,
+                                y,
+                                target_center_2,
+                                target_scale_2,
+                                loss_type=args.loss_type,
+                                phi_mode=args.phi_mode,
+                                phi_vec_weight=args.phi_vec_weight,
+                                target_weights=target_weights,
+                            )
+
+                        if not torch.isfinite(loss):
+                            raise RuntimeError(f"Non-finite loss for {batch_id}")
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                    except Exception as e:
+                        if quarantine_bad_batch(
+                            graph,
+                            e,
+                            where="train/forward",
+                            quarantine_file=args.bad_graphs_file,
+                            skip_bad_graphs=args.skip_bad_graphs,
+                        ):
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                            continue
+                        fail_fast_bad_batch(graph, e, where="train/forward")
+
+                    total_loss += loss
+                    graphs_used += 1
+                    train_loss += loss.detach()
+                    train_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+
+                    pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
+                    metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
+                    train_abs_err += metric_parts["abs_err"]
+                    train_sq_err += metric_parts["sq_err"]
+                    train_smape_sum += metric_parts["smape"]
+                    train_pt_mape_sum += metric_parts["pt_mape"]
+
+                    del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
+
+                if graphs_used == 0:
+                    continue
+
+                batch_loss = total_loss / float(graphs_used)
                 if scaler.is_enabled():
-                    scaler.scale(loss).backward()
+                    scaler.scale(batch_loss).backward()
                     scaler.unscale_(opt)
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                     scaler.step(opt)
                     scaler.update()
                 else:
-                    loss.backward()
+                    batch_loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                     opt.step()
 
@@ -1958,18 +2012,7 @@ def main():
                 if args.lr_schedule == "cosine":
                     scheduler.step()
 
-                train_loss += loss.detach()
-                train_steps += 1.0
-                train_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
-
-                pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
-                metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
-                train_abs_err += metric_parts["abs_err"]
-                train_sq_err += metric_parts["sq_err"]
-                train_smape_sum += metric_parts["smape"]
-                train_pt_mape_sum += metric_parts["pt_mape"]
-
-                del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
+                train_steps += float(graphs_used)
 
         gc.collect()
         if device.type == "cuda":
@@ -2004,50 +2047,58 @@ def main():
         with eval_ctx:
             with torch.no_grad():
                 for batch in val_loader:
-                    try:
-                        validate_graph_batch(batch, where="val/cpu")
-                        batch = move_batch_to_device(batch, device)
-                        x = batch["x"]
-                        edge_index = batch["edge_index"]
-                        edge_attr = batch["edge_attr"]
-                        y = batch["y_track"].float()
+                    graphs = [batch] if isinstance(batch, dict) else list(batch)
+                    for graph in graphs:
+                        try:
+                            validate_graph_batch(graph, where="val/cpu")
+                            graph = move_batch_to_device(graph, device)
+                            x = graph["x"]
+                            edge_index = graph["edge_index"]
+                            edge_attr = graph["edge_attr"]
+                            y = graph["y_track"].float()
+                            if device.type == "cuda":
+                                torch.cuda.synchronize(device)
+                        except Exception as e:
+                            if quarantine_bad_batch(
+                                graph,
+                                e,
+                                where="val/load_or_h2d",
+                                quarantine_file=args.bad_graphs_file,
+                                skip_bad_graphs=args.skip_bad_graphs,
+                            ):
+                                continue
+                            fail_fast_bad_batch(graph, e, where="val/load_or_h2d")
+
+                        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                            pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
+                            loss, pieces = compute_total_loss(
+                                pred_dict,
+                                y,
+                                target_center_2,
+                                target_scale_2,
+                                loss_type=args.loss_type,
+                                phi_mode=args.phi_mode,
+                                phi_vec_weight=args.phi_vec_weight,
+                                target_weights=target_weights,
+                            )
+
+                        if not torch.isfinite(loss):
+                            raise RuntimeError(f"Non-finite val loss for {_batch_id_string(graph)}")
                         if device.type == "cuda":
                             torch.cuda.synchronize(device)
-                    except Exception as e:
-                        if quarantine_bad_batch(batch, e, where="val/load_or_h2d", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
-                            continue
-                        fail_fast_bad_batch(batch, e, where="val/load_or_h2d")
 
-                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
-                        loss, pieces = compute_total_loss(
-                            pred_dict,
-                            y,
-                            target_center_2,
-                            target_scale_2,
-                            loss_type=args.loss_type,
-                            phi_mode=args.phi_mode,
-                            phi_vec_weight=args.phi_vec_weight,
-                            target_weights=target_weights,
-                        )
+                        pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
+                        metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
 
-                    if not torch.isfinite(loss):
-                        raise RuntimeError(f"Non-finite val loss for {_batch_id_string(batch)}")
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
+                        val_loss += loss.detach()
+                        val_steps += 1.0
+                        val_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+                        val_abs_err += metric_parts["abs_err"]
+                        val_sq_err += metric_parts["sq_err"]
+                        val_smape_sum += metric_parts["smape"]
+                        val_pt_mape_sum += metric_parts["pt_mape"]
 
-                    pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
-                    metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
-
-                    val_loss += loss.detach()
-                    val_steps += 1.0
-                    val_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
-                    val_abs_err += metric_parts["abs_err"]
-                    val_sq_err += metric_parts["sq_err"]
-                    val_smape_sum += metric_parts["smape"]
-                    val_pt_mape_sum += metric_parts["pt_mape"]
-
-                    del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
+                        del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
 
         gc.collect()
         if device.type == "cuda":
