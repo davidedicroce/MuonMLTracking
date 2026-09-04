@@ -24,6 +24,7 @@ import math
 import os
 import random
 import signal
+import threading
 import time
 import traceback
 from contextlib import contextmanager, nullcontext
@@ -50,6 +51,84 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 import wandb
+
+
+# Runtime resources are explicitly registered so an interrupt can shut down
+# persistent DataLoader workers and pin-memory threads before DDP teardown.
+_runtime_dataloaders: List[Any] = []
+_runtime_datasets: List[Any] = []
+_termination_started = False
+
+
+class _GracefulTermination(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(f"received signal {int(signum)}")
+        self.signum = int(signum)
+
+
+def _termination_signal_handler(signum, _frame) -> None:
+    global _termination_started
+    # torchrun commonly escalates SIGINT -> SIGTERM while a worker is cleaning up.
+    # Raise only on the first signal; ignore later escalation long enough for the
+    # explicit DataLoader/DDP cleanup in __main__ to complete.
+    if _termination_started:
+        return
+    _termination_started = True
+    raise _GracefulTermination(int(signum))
+
+
+def _install_termination_signal_handlers() -> None:
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _termination_signal_handler)
+        except Exception:
+            pass
+
+
+def _register_runtime_dataset(ds: Any) -> Any:
+    _runtime_datasets.append(ds)
+    return ds
+
+
+def _register_runtime_dataloader(loader: DataLoader) -> DataLoader:
+    _runtime_dataloaders.append(loader)
+    return loader
+
+
+def _shutdown_dataloader(loader: DataLoader) -> None:
+    # PyTorch currently exposes no public DataLoader.close().  Persistent workers
+    # live on loader._iterator, whose private shutdown hook is what DataLoader's
+    # own destructor uses.  Guard every access for compatibility across releases.
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception:
+            pass
+    try:
+        loader._iterator = None
+    except Exception:
+        pass
+
+
+def _cleanup_runtime_resources() -> None:
+    while _runtime_dataloaders:
+        loader = _runtime_dataloaders.pop()
+        _shutdown_dataloader(loader)
+
+    while _runtime_datasets:
+        ds = _runtime_datasets.pop()
+        close_files = getattr(ds, "_close_files", None)
+        if callable(close_files):
+            try:
+                close_files()
+            except Exception:
+                pass
 
 
 # ----------------------------
@@ -115,6 +194,87 @@ def _append_line_atomic(path: str, line: str) -> None:
     _ensure_parent_dir(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(line.rstrip("\n") + "\n")
+
+
+def _ordered_h5_names(paths) -> List[str]:
+    """Return portable ordered file identifiers for split compatibility checks."""
+    return [Path(str(path)).name for path in paths]
+
+
+def _dataset_graph_counts_by_file(ds) -> List[int]:
+    """Count indexed graphs per H5 file without reopening the files."""
+    counts = [0] * len(ds.h5_paths)
+    for file_idx, _graph_key in ds.index:
+        counts[int(file_idx)] += 1
+    return counts
+
+
+def _validate_split_compatibility(split, *, current_paths, ds) -> None:
+    """Validate that a split still addresses the same ordered dataset after relocation.
+
+    Absolute paths are accepted when unchanged.  If the dataset was copied to a new
+    mount point, ordered basenames plus per-file graph counts (new split schema), or
+    ordered basenames plus the total graph count (legacy schema), are used instead.
+    """
+    if "h5_paths" not in split.files:
+        return
+
+    saved_paths = [str(path) for path in split["h5_paths"].tolist()]
+    current_abs_paths = [str(Path(path).resolve()) for path in current_paths]
+    if saved_paths == current_abs_paths:
+        return
+
+    saved_names = (
+        [str(name) for name in split["h5_file_names"].tolist()]
+        if "h5_file_names" in split.files
+        else _ordered_h5_names(saved_paths)
+    )
+    current_names = _ordered_h5_names(current_abs_paths)
+
+    if len(set(saved_names)) != len(saved_names) or len(set(current_names)) != len(current_names):
+        raise RuntimeError(
+            "Split/data paths differ and basename-only relocation matching is ambiguous "
+            "because duplicate H5 filenames are present. Regenerate the split at the "
+            "current data location."
+        )
+
+    if saved_names != current_names:
+        raise RuntimeError(
+            "Split file is for different H5 files or ordering.\n"
+            f"  split files:   {saved_names}\n"
+            f"  current files: {current_names}\n"
+            "Regenerate the split for the current --data-glob."
+        )
+
+    current_counts = _dataset_graph_counts_by_file(ds)
+    if "h5_graph_counts" in split.files:
+        saved_counts = [int(value) for value in split["h5_graph_counts"].tolist()]
+        if saved_counts != current_counts:
+            raise RuntimeError(
+                "H5 filenames/order match after relocation, but per-file graph counts differ.\n"
+                f"  split counts:   {saved_counts}\n"
+                f"  current counts: {current_counts}\n"
+                "The copied dataset is not identical; regenerate the split."
+            )
+    elif "n_graphs" in split.files:
+        saved_total = int(np.asarray(split["n_graphs"]).item())
+        if saved_total != len(ds):
+            raise RuntimeError(
+                "H5 filenames/order match after relocation, but the total graph count differs: "
+                f"split={saved_total}, current={len(ds)}. Regenerate the split."
+            )
+    else:
+        raise RuntimeError(
+            "Split/data absolute paths differ and the split has no graph-count metadata "
+            "to verify a safe relocation. Regenerate the split at the current data location."
+        )
+
+    if ddp_is_main():
+        print(
+            "[split] accepted relocated H5 dataset: ordered filenames and graph counts match "
+            "the split metadata",
+            flush=True,
+        )
 
 
 def _jsonable_error(exc: Exception) -> Dict[str, Any]:
@@ -500,8 +660,82 @@ class H5TrackGraphDataset(Dataset):
 
 
 def collate_one(batch):
+    # Kept for target-statistics estimation, which intentionally scans one graph at a time.
     assert len(batch) == 1
     return batch[0]
+
+
+def collate_graphs(samples):
+    """Batch independent variable-size graphs without introducing cross-graph edges.
+
+    Nodes and edges are concatenated.  Each graph's local edge indices are shifted by
+    its node offset, and ``batch_index`` records which graph each node belongs to.
+    Targets are stacked to [B, 3].
+    """
+    if not samples:
+        raise ValueError("Cannot collate an empty graph batch.")
+
+    xs = []
+    edge_indices = []
+    edge_attrs = []
+    ys = []
+    batch_indices = []
+    graph_keys = []
+    source_paths = []
+    original_node_ids = []
+
+    node_offset = 0
+    for graph_idx, sample in enumerate(samples):
+        x = sample["x"]
+        edge_index = sample["edge_index"]
+        edge_attr = sample["edge_attr"]
+        y = sample["y_track"]
+
+        if x.ndim != 2 or x.shape[0] <= 0:
+            raise ValueError(f"Graph {graph_idx} has invalid x shape {tuple(x.shape)}")
+        if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+            raise ValueError(f"Graph {graph_idx} has invalid edge_index shape {tuple(edge_index.shape)}")
+        if edge_attr.ndim != 2 or edge_attr.shape[0] != edge_index.shape[1]:
+            raise ValueError(
+                f"Graph {graph_idx} has inconsistent edge_attr/edge_index shapes: "
+                f"{tuple(edge_attr.shape)} vs {tuple(edge_index.shape)}"
+            )
+        if y.ndim != 1 or y.numel() != 3:
+            raise ValueError(f"Graph {graph_idx} has invalid y_track shape {tuple(y.shape)}")
+
+        n_nodes = int(x.shape[0])
+        xs.append(x)
+        edge_attrs.append(edge_attr)
+        ys.append(y)
+        batch_indices.append(torch.full((n_nodes,), graph_idx, dtype=torch.long))
+
+        if edge_index.numel() > 0:
+            edge_indices.append(edge_index + node_offset)
+        else:
+            edge_indices.append(edge_index)
+
+        graph_keys.append(sample.get("graph_key", f"graph_{graph_idx}"))
+        source_paths.append(sample.get("source_path", "<unknown_file>"))
+        original_node_ids.append(sample.get("original_node_ids", None))
+        node_offset += n_nodes
+
+    x_batch = torch.cat(xs, dim=0)
+    edge_index_batch = torch.cat(edge_indices, dim=1)
+    edge_attr_batch = torch.cat(edge_attrs, dim=0)
+    y_batch = torch.stack(ys, dim=0)
+    batch_index = torch.cat(batch_indices, dim=0)
+
+    return {
+        "x": x_batch,
+        "edge_index": edge_index_batch,
+        "edge_attr": edge_attr_batch,
+        "y_track": y_batch,
+        "batch_index": batch_index,
+        "num_graphs": len(samples),
+        "graph_key": graph_keys,
+        "source_path": source_paths,
+        "original_node_ids": original_node_ids,
+    }
 
 
 def h5_worker_init_fn(worker_id: int) -> None:
@@ -523,13 +757,19 @@ def h5_worker_init_fn(worker_id: int) -> None:
 def _batch_id_string(batch: Dict[str, Any]) -> str:
     graph_key = batch.get("graph_key", "<unknown_graph>")
     source_path = batch.get("source_path", "<unknown_file>")
+    if isinstance(graph_key, (list, tuple)):
+        n = len(graph_key)
+        preview = ", ".join(str(k) for k in graph_key[:3])
+        if n > 3:
+            preview += ", ..."
+        return f"batch[{n}] graphs=({preview})"
     return f"{source_path} :: graphs/{graph_key}"
 
 
 def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
     bid = _batch_id_string(batch)
 
-    for req in ("x", "edge_index", "edge_attr", "y_track"):
+    for req in ("x", "edge_index", "edge_attr", "y_track", "batch_index"):
         if req not in batch:
             raise RuntimeError(f"[validate:{where}] missing key '{req}' in batch {bid}")
 
@@ -537,6 +777,7 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
     edge_index = batch["edge_index"]
     edge_attr = batch["edge_attr"]
     y = batch["y_track"]
+    batch_index = batch["batch_index"]
 
     if x.ndim != 2:
         raise RuntimeError(f"[validate:{where}] x must have shape [N, F], got {tuple(x.shape)} in {bid}")
@@ -548,19 +789,40 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
         raise RuntimeError(
             f"[validate:{where}] edge_attr must have shape [E, Fe], got {tuple(edge_attr.shape)} in {bid}"
         )
-    if y.ndim != 1 or y.numel() != 3:
+    if y.ndim != 2 or y.shape[1] != 3:
         raise RuntimeError(
-            f"[validate:{where}] y_track must have shape [3], got {tuple(y.shape)} in {bid}"
+            f"[validate:{where}] y_track must have shape [B, 3], got {tuple(y.shape)} in {bid}"
         )
+    if batch_index.ndim != 1 or batch_index.shape[0] != x.shape[0]:
+        raise RuntimeError(
+            f"[validate:{where}] batch_index must have shape [N], got {tuple(batch_index.shape)} "
+            f"for N={x.shape[0]} in {bid}"
+        )
+    if batch_index.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(f"[validate:{where}] batch_index must be integer in {bid}")
+
+    n_graphs = int(y.shape[0])
+    if n_graphs <= 0:
+        raise RuntimeError(f"[validate:{where}] batch has no graphs in {bid}")
+    if x.shape[0] <= 0:
+        raise RuntimeError(f"[validate:{where}] batch has no nodes in {bid}")
+
+    batch_min = int(batch_index.min().item())
+    batch_max = int(batch_index.max().item())
+    if batch_min != 0 or batch_max != n_graphs - 1:
+        raise RuntimeError(
+            f"[validate:{where}] batch_index range must be [0,{n_graphs - 1}], "
+            f"got [{batch_min},{batch_max}] in {bid}"
+        )
+    counts = torch.bincount(batch_index.to(torch.long), minlength=n_graphs)
+    if counts.numel() != n_graphs or torch.any(counts == 0):
+        raise RuntimeError(f"[validate:{where}] every graph must contain at least one node in {bid}")
 
     if edge_index.shape[1] != edge_attr.shape[0]:
         raise RuntimeError(
             f"[validate:{where}] edge count mismatch: edge_index has E={edge_index.shape[1]} "
             f"but edge_attr has E={edge_attr.shape[0]} in {bid}"
         )
-
-    if x.shape[0] <= 0:
-        raise RuntimeError(f"[validate:{where}] graph has no nodes in {bid}")
 
     if edge_index.numel() > 0:
         if edge_index.dtype not in (torch.int32, torch.int64):
@@ -579,6 +841,14 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
                 f"min={ei_min}, max={ei_max}, n_nodes={n_nodes}, "
                 f"bad_positions={bad_preview}"
             )
+        src_graph = batch_index[edge_index[0].long()]
+        dst_graph = batch_index[edge_index[1].long()]
+        if not torch.equal(src_graph, dst_graph):
+            bad = (src_graph != dst_graph).nonzero(as_tuple=False)[:8].reshape(-1).tolist()
+            raise RuntimeError(
+                f"[validate:{where}] found cross-graph edges after collation in {bid}; "
+                f"edge positions={bad}"
+            )
 
     for name, t in (("x", x), ("edge_attr", edge_attr), ("y_track", y)):
         if not torch.isfinite(t).all():
@@ -596,6 +866,8 @@ def validate_graph_batch(batch: Dict[str, Any], *, where: str = "") -> None:
         batch["edge_attr"] = edge_attr.contiguous()
     if not y.is_contiguous():
         batch["y_track"] = y.contiguous()
+    if not batch_index.is_contiguous():
+        batch["batch_index"] = batch_index.contiguous()
 
 
 # ----------------------------
@@ -716,52 +988,253 @@ class CustomGAT(nn.Module):
         concat: bool = True,
         dropout: float = 0.0,
         add_self_loops: bool = True,
+        edge_dim: int = 0,
+        edge_attention: bool = False,
+        gatv2_edge_attention: bool = False,
     ):
         super().__init__()
+        self.in_channels = in_channels
         self.out_channels = out_channels
         self.heads = heads
         self.concat = concat
         self.add_self_loops = add_self_loops
+        self.edge_dim = int(edge_dim or 0)
+        self.edge_attention = bool(edge_attention)
+        self.gatv2_edge_attention = bool(gatv2_edge_attention)
+        if self.edge_attention and self.gatv2_edge_attention:
+            raise ValueError(
+                "GAT edge-bias attention and GATv2 source-destination-edge attention "
+                "are mutually exclusive."
+            )
         self.dropout = nn.Dropout(dropout)
 
         self.linear = nn.Linear(in_channels, heads * out_channels, bias=False)
-        self.attn_l = nn.Parameter(torch.empty(1, heads, out_channels))
-        self.attn_r = nn.Parameter(torch.empty(1, heads, out_channels))
-        nn.init.xavier_uniform_(self.attn_l)
-        nn.init.xavier_uniform_(self.attn_r)
+        if self.gatv2_edge_attention:
+            # These parameters belong to the baseline/edge-bias GAT scorer and
+            # would be unused in DDP for the GATv2 scorer.
+            self.register_parameter("attn_l", None)
+            self.register_parameter("attn_r", None)
+        else:
+            self.attn_l = nn.Parameter(torch.empty(1, heads, out_channels))
+            self.attn_r = nn.Parameter(torch.empty(1, heads, out_channels))
+            nn.init.xavier_uniform_(self.attn_l)
+            nn.init.xavier_uniform_(self.attn_r)
+
+        if self.edge_attention:
+            if self.edge_dim <= 0:
+                raise ValueError("edge_dim must be positive when GAT edge attention is enabled")
+            edge_hidden = max(8, 2 * self.edge_dim)
+            self.edge_attn_encoder = nn.Sequential(
+                nn.LayerNorm(self.edge_dim),
+                nn.Linear(self.edge_dim, edge_hidden, bias=False),
+                nn.SiLU(),
+                nn.Linear(edge_hidden, heads, bias=False),
+            )
+        else:
+            self.edge_attn_encoder = None
+
+        if self.gatv2_edge_attention:
+            if self.edge_dim <= 0:
+                raise ValueError(
+                    "edge_dim must be positive when GATv2 source-destination-edge "
+                    "attention is enabled"
+                )
+            # Edge-GATv2-style attention:
+            #   z_ij = W_src h_j + W_dst h_i + W_edge e_ij
+            #   score_ij = a^T SiLU(z_ij)
+            self.gatv2_attn_src = nn.Linear(
+                in_channels, heads * out_channels, bias=False
+            )
+            self.gatv2_attn_dst = nn.Linear(
+                in_channels, heads * out_channels, bias=False
+            )
+            self.gatv2_attn_edge = nn.Linear(
+                self.edge_dim, heads * out_channels, bias=False
+            )
+            self.gatv2_attn_score = nn.Parameter(
+                torch.empty(1, heads, out_channels)
+            )
+            # Keep the message/value path separate from the attention path:
+            #   m_ij = SiLU(V_src h_j + V_dst h_i + V_edge e_ij)
+            self.gatv2_msg_dst = nn.Linear(
+                in_channels, heads * out_channels, bias=False
+            )
+            self.gatv2_msg_edge = nn.Linear(
+                self.edge_dim, heads * out_channels, bias=False
+            )
+            nn.init.xavier_uniform_(self.gatv2_attn_src.weight)
+            nn.init.xavier_uniform_(self.gatv2_attn_dst.weight)
+            nn.init.xavier_uniform_(self.gatv2_attn_edge.weight)
+            nn.init.xavier_uniform_(self.gatv2_attn_score)
+            nn.init.xavier_uniform_(self.gatv2_msg_dst.weight)
+            nn.init.xavier_uniform_(self.gatv2_msg_edge.weight)
+        else:
+            self.gatv2_attn_src = None
+            self.gatv2_attn_dst = None
+            self.gatv2_attn_edge = None
+            self.register_parameter("gatv2_attn_score", None)
+            self.gatv2_msg_dst = None
+            self.gatv2_msg_edge = None
 
         if not concat:
             self.out_proj = nn.Linear(heads * out_channels, out_channels, bias=False)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
         num_nodes = x.size(0)
-        x = self.linear(x).view(num_nodes, self.heads, self.out_channels)
+        node_input = x
+        x = self.linear(node_input).view(num_nodes, self.heads, self.out_channels)
         out_dtype = x.dtype
         x_f = x.float()
+
+        if self.gatv2_edge_attention:
+            if (
+                self.gatv2_attn_src is None
+                or self.gatv2_attn_dst is None
+                or self.gatv2_attn_edge is None
+                or self.gatv2_attn_score is None
+                or self.gatv2_msg_dst is None
+                or self.gatv2_msg_edge is None
+            ):
+                raise RuntimeError("GATv2 attention/message modules were not initialized.")
+            gatv2_src_f = self.gatv2_attn_src(node_input).view(
+                num_nodes, self.heads, self.out_channels
+            ).float()
+            gatv2_dst_f = self.gatv2_attn_dst(node_input).view(
+                num_nodes, self.heads, self.out_channels
+            ).float()
+            gatv2_msg_dst_f = self.gatv2_msg_dst(node_input).view(
+                num_nodes, self.heads, self.out_channels
+            ).float()
+        else:
+            gatv2_src_f = None
+            gatv2_dst_f = None
+            gatv2_msg_dst_f = None
+
+        if self.edge_attention or self.gatv2_edge_attention:
+            if edge_attr is None:
+                raise RuntimeError("Edge-aware GAT attention requires edge_attr.")
+            if edge_attr.shape[0] != edge_index.shape[1]:
+                raise RuntimeError(
+                    f"edge_attr rows ({edge_attr.shape[0]}) do not match edges ({edge_index.shape[1]})."
+                )
+            if edge_attr.shape[1] != self.edge_dim:
+                raise RuntimeError(
+                    f"edge_attr dim ({edge_attr.shape[1]}) does not match configured edge_dim ({self.edge_dim})."
+                )
+
+        # Apply the same edge-dropout regularization used by the MPNN path.
+        # For edge-aware attention the attributes are filtered with the topology.
+        if self.training and edge_dropout_p > 0.0 and edge_index.shape[1] > 0:
+            keep = torch.rand(edge_index.shape[1], device=edge_index.device) >= float(edge_dropout_p)
+            if not bool(keep.any()):
+                keep[torch.randint(0, edge_index.shape[1], (1,), device=edge_index.device)] = True
+            edge_index = edge_index[:, keep]
+            if edge_attr is not None:
+                edge_attr = edge_attr[keep]
 
         if self.add_self_loops:
             self_loops = torch.arange(num_nodes, device=x.device).unsqueeze(0).repeat(2, 1)
             edge_index = torch.cat([edge_index, self_loops], dim=1)
+            if self.edge_attention or self.gatv2_edge_attention:
+                if edge_attr is None:
+                    raise RuntimeError("Edge-aware GAT attention requires edge_attr.")
+                # A zero vector is the neutral synthetic edge feature for self loops.
+                loop_attr = torch.zeros(
+                    (num_nodes, edge_attr.shape[1]),
+                    device=edge_attr.device,
+                    dtype=edge_attr.dtype,
+                )
+                edge_attr = torch.cat([edge_attr, loop_attr], dim=0)
+
+        if self.edge_attention or self.gatv2_edge_attention:
+            if edge_attr is None:
+                raise RuntimeError("Edge-aware GAT attention requires edge_attr.")
+            if edge_attr.shape[0] != edge_index.shape[1]:
+                raise RuntimeError(
+                    f"edge_attr rows ({edge_attr.shape[0]}) do not match edges ({edge_index.shape[1]})."
+                )
+            if edge_attr.shape[1] != self.edge_dim:
+                raise RuntimeError(
+                    f"edge_attr dim ({edge_attr.shape[1]}) does not match configured edge_dim ({self.edge_dim})."
+                )
 
         src = edge_index[0]
         dst = edge_index[1]
 
-        alpha_l = (x_f[src] * self.attn_l).sum(dim=-1)
-        alpha_r = (x_f[dst] * self.attn_r).sum(dim=-1)
-        alpha = F.leaky_relu(alpha_l + alpha_r, negative_slope=0.2)
+        if self.gatv2_edge_attention:
+            if (
+                edge_attr is None
+                or gatv2_src_f is None
+                or gatv2_dst_f is None
+                or self.gatv2_attn_edge is None
+                or self.gatv2_attn_score is None
+                or gatv2_msg_dst_f is None
+                or self.gatv2_msg_edge is None
+            ):
+                raise RuntimeError("GATv2 attention/message inputs are unavailable.")
+            edge_f = self.gatv2_attn_edge(edge_attr.float()).view(
+                edge_attr.shape[0], self.heads, self.out_channels
+            ).float()
+            alpha_hidden = gatv2_src_f[src] + gatv2_dst_f[dst] + edge_f
+            alpha = (F.silu(alpha_hidden) * self.gatv2_attn_score.float()).sum(dim=-1)
+            msg_edge_f = self.gatv2_msg_edge(edge_attr.float()).view(
+                edge_attr.shape[0], self.heads, self.out_channels
+            ).float()
+            messages = F.silu(x_f[src] + gatv2_msg_dst_f[dst] + msg_edge_f)
+        else:
+            if self.attn_l is None or self.attn_r is None:
+                raise RuntimeError("Baseline GAT attention parameters are unavailable.")
+            alpha_l = (x_f[src] * self.attn_l).sum(dim=-1)
+            alpha_r = (x_f[dst] * self.attn_r).sum(dim=-1)
+            alpha_raw = alpha_l + alpha_r
+            if self.edge_attn_encoder is not None:
+                if edge_attr is None:
+                    raise RuntimeError("GAT edge-bias attention requires edge_attr.")
+                alpha_raw = alpha_raw + self.edge_attn_encoder(edge_attr.float())
+            alpha = F.leaky_relu(alpha_raw, negative_slope=0.2)
+            messages = x_f[src]
 
-        alpha = torch.exp(alpha - alpha.max(dim=0, keepdim=True)[0])
+        # Stable segment softmax.  The old TrackGraph implementation subtracted
+        # one maximum per head over the entire batched graph.  Here each
+        # destination node/head gets its own maximum, so disconnected graphs in
+        # a mini-batch cannot affect one another through floating-point scaling.
+        alpha_max = torch.full(
+            (num_nodes, self.heads),
+            -torch.inf,
+            device=x.device,
+            dtype=torch.float32,
+        )
+        if hasattr(alpha_max, "scatter_reduce_"):
+            alpha_max.scatter_reduce_(
+                0,
+                dst.unsqueeze(-1).expand_as(alpha),
+                alpha,
+                reduce="amax",
+                include_self=True,
+            )
+        else:  # compatibility fallback for older PyTorch versions
+            for node_idx in range(num_nodes):
+                mask = dst == node_idx
+                if bool(mask.any()):
+                    alpha_max[node_idx] = alpha[mask].max(dim=0).values
+        alpha = torch.exp(alpha - alpha_max[dst])
         alpha_sum = torch.zeros((num_nodes, self.heads), device=x.device, dtype=torch.float32)
         alpha_sum.scatter_add_(0, dst.unsqueeze(-1).expand_as(alpha), alpha)
         alpha = alpha / alpha_sum[dst].clamp(min=1e-6)
         alpha = self.dropout(alpha)
 
         out = torch.zeros((num_nodes, self.heads, self.out_channels), device=x.device, dtype=torch.float32)
-        for h in range(self.heads):
-            out[:, h].scatter_add_(
+        for head_idx in range(self.heads):
+            out[:, head_idx].scatter_add_(
                 0,
-                dst.unsqueeze(-1).expand_as(x_f[src, h]),
-                alpha[:, h].unsqueeze(-1) * x_f[src, h],
+                dst.unsqueeze(-1).expand_as(messages[:, head_idx]),
+                alpha[:, head_idx].unsqueeze(-1) * messages[:, head_idx],
             )
 
         if self.concat:
@@ -858,7 +1331,16 @@ class Edge_ResidualBlock(nn.Module):
 
 
 class GATResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, heads: int = 4, dropout: float = 0.2):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        heads: int = 4,
+        dropout: float = 0.2,
+        edge_dim: int = 0,
+        edge_attention: bool = False,
+        gatv2_edge_attention: bool = False,
+    ):
         super().__init__()
         self.project = nn.Linear(in_channels, out_channels * heads) if in_channels != out_channels * heads else None
         self.gat = CustomGAT(
@@ -868,14 +1350,30 @@ class GATResidualBlock(nn.Module):
             dropout=dropout,
             add_self_loops=True,
             concat=True,
+            edge_dim=edge_dim,
+            edge_attention=edge_attention,
+            gatv2_edge_attention=gatv2_edge_attention,
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
         if self.project is not None:
             x = self.project(x)
         identity = x
-        x = F.relu(self.gat(x, edge_index))
+        x = F.relu(
+            self.gat(
+                x,
+                edge_index,
+                edge_attr=edge_attr,
+                edge_dropout_p=edge_dropout_p,
+            )
+        )
         x = self.dropout(x)
         return identity + x
 
@@ -964,6 +1462,8 @@ class TrackGraphRegressorGNN(nn.Module):
         dropout=0.1,
         layer_type: str = "mpnn",
         gat_heads: int = 4,
+        gat_edge_attn: bool = False,
+        gatv2_edge_attn: bool = True,
         sage_aggr: str = "mean",
         edgeconv_aggr: str = "mean",
         use_fourier=False,
@@ -977,6 +1477,8 @@ class TrackGraphRegressorGNN(nn.Module):
         self.fourier = None
         self.layer_type = layer_type
         self.gat_heads = gat_heads
+        self.gat_edge_attn = bool(gat_edge_attn)
+        self.gatv2_edge_attn = bool(gatv2_edge_attn)
         self.sage_aggr = sage_aggr
         self.edgeconv_aggr = edgeconv_aggr
         self.graph_pool = graph_pool
@@ -989,6 +1491,7 @@ class TrackGraphRegressorGNN(nn.Module):
             xdim_in = xdim
 
         self.node_enc = MLP(xdim_in, hdim, hidden_dim=hdim, n_layers=2, dropout=dropout)
+        self._gat_layer = False
 
         if layer_type == "mpnn":
             self.layers = nn.ModuleList([EdgeMPNNLayer(hdim, edim, dropout=dropout) for _ in range(n_layers)])
@@ -1006,16 +1509,29 @@ class TrackGraphRegressorGNN(nn.Module):
             ])
             self._uses_edge_attr = False
         elif layer_type == "gat_residual":
+            if gat_edge_attn and gatv2_edge_attn:
+                raise ValueError("--gat-edge-attn and --gatv2-edge-attn are mutually exclusive")
             if gat_heads <= 0:
                 raise ValueError("--gat-heads must be >= 1")
             if hdim % gat_heads != 0:
                 raise ValueError(f"hidden_dim={hdim} must be divisible by gat_heads={gat_heads}")
             per_head = hdim // gat_heads
             self.layers = nn.ModuleList([
-                GATResidualBlock(in_channels=hdim, out_channels=per_head, heads=gat_heads, dropout=dropout)
+                GATResidualBlock(
+                    in_channels=hdim,
+                    out_channels=per_head,
+                    heads=gat_heads,
+                    dropout=dropout,
+                    edge_dim=edim,
+                    edge_attention=gat_edge_attn,
+                    gatv2_edge_attention=gatv2_edge_attn,
+                )
                 for _ in range(n_layers)
             ])
-            self._uses_edge_attr = False
+            # Even baseline GAT consumes edge_index under edge dropout. Edge-aware
+            # variants additionally consume edge_attr in attention/messages.
+            self._uses_edge_attr = bool(gat_edge_attn or gatv2_edge_attn)
+            self._gat_layer = True
         else:
             raise ValueError(f"Unknown layer_type={layer_type}")
 
@@ -1025,36 +1541,57 @@ class TrackGraphRegressorGNN(nn.Module):
         phi_out_dim = 2 if phi_mode == "sincos" else 1
         self.head_phi = MLP(pooled_dim, phi_out_dim, hidden_dim=hdim, n_layers=2, dropout=dropout)
 
-    def _pool_graph(self, h: torch.Tensor) -> torch.Tensor:
-        pooled_dim = self.head_pt.net[0].in_features
-        if h.size(0) == 0:
-            return h.new_zeros((1, pooled_dim), dtype=h.dtype)
+    def _pool_graph(self, h: torch.Tensor, batch_index: torch.Tensor, num_graphs: int) -> torch.Tensor:
+        """Pool node embeddings independently for each graph in the mini-batch."""
+        if h.size(0) == 0 or num_graphs <= 0:
+            raise ValueError("Cannot pool an empty graph batch.")
+
+        batch_index = batch_index.to(device=h.device, dtype=torch.long)
+        counts = torch.bincount(batch_index, minlength=num_graphs).to(dtype=h.dtype).clamp(min=1.0)
+
+        h_sum = h.new_zeros((num_graphs, h.size(1)))
+        h_sum.index_add_(0, batch_index, h)
+        h_mean = h_sum / counts.unsqueeze(1)
 
         if self.graph_pool == "mean":
-            return h.mean(dim=0, keepdim=True)
+            return h_mean
+
+        h_max = h.new_full((num_graphs, h.size(1)), float("-inf"))
+        expanded_index = batch_index.unsqueeze(1).expand_as(h)
+        if hasattr(h_max, "scatter_reduce_"):
+            h_max.scatter_reduce_(0, expanded_index, h, reduce="amax", include_self=True)
+        else:  # compatibility fallback for older PyTorch versions
+            for graph_idx in range(num_graphs):
+                h_max[graph_idx] = h[batch_index == graph_idx].max(dim=0).values
+        h_max = torch.where(torch.isfinite(h_max), h_max, torch.zeros_like(h_max))
+
         if self.graph_pool == "max":
-            return h.max(dim=0, keepdim=True).values
+            return h_max
         if self.graph_pool == "meanmax":
-            h_mean = h.mean(dim=0, keepdim=True)
-            h_max = h.max(dim=0, keepdim=True).values
             return torch.cat([h_mean, h_max], dim=1)
         raise ValueError(f"Unsupported graph_pool={self.graph_pool}")
 
-    def forward(self, x, edge_index, edge_attr, edge_dropout_p: float = 0.0):
+    def forward(self, x, edge_index, edge_attr, batch_index, num_graphs: int, edge_dropout_p: float = 0.0):
         if self.fourier is not None:
             x = self.fourier(x)
 
         h = self.node_enc(x)
         for layer in self.layers:
-            if self._uses_edge_attr:
+            if self._gat_layer:
+                h = layer(
+                    h, edge_index,
+                    edge_attr=edge_attr if self._uses_edge_attr else None,
+                    edge_dropout_p=edge_dropout_p,
+                )
+            elif self._uses_edge_attr:
                 h = layer(h, edge_index, edge_attr, edge_dropout_p=edge_dropout_p)
             else:
                 h = layer(h, edge_index)
 
-        g = self._pool_graph(h)
-        pt = self.head_pt(g).squeeze(0).squeeze(-1)
-        eta = self.head_eta(g).squeeze(0).squeeze(-1)
-        phi_raw = self.head_phi(g).squeeze(0)
+        g = self._pool_graph(h, batch_index=batch_index, num_graphs=int(num_graphs))
+        pt = self.head_pt(g).squeeze(-1)
+        eta = self.head_eta(g).squeeze(-1)
+        phi_raw = self.head_phi(g)
         return {
             "pt": pt,
             "eta": eta,
@@ -1077,6 +1614,27 @@ def _make_stats_loader(dataset, *, num_workers: int = 0):
     )
 
 
+def encode_pt_target(pt: torch.Tensor, mode: str = "linear", asinh_scale: float = 10.0) -> torch.Tensor:
+    """Map the physical/signed pt-like target to a regression-friendly coordinate."""
+    mode = str(mode).lower()
+    if mode == "linear":
+        return pt
+    if mode == "asinh":
+        scale = max(float(asinh_scale), 1e-6)
+        return torch.asinh(pt / scale)
+    raise ValueError(f"Unsupported pt_transform={mode}")
+
+
+def decode_pt_target(encoded_pt: torch.Tensor, mode: str = "linear", asinh_scale: float = 10.0) -> torch.Tensor:
+    mode = str(mode).lower()
+    if mode == "linear":
+        return encoded_pt
+    if mode == "asinh":
+        scale = max(float(asinh_scale), 1e-6)
+        return scale * torch.sinh(encoded_pt)
+    raise ValueError(f"Unsupported pt_transform={mode}")
+
+
 @torch.no_grad()
 def estimate_target_transform(
     train_ds,
@@ -1084,6 +1642,8 @@ def estimate_target_transform(
     mode: str = "none",
     max_events: int = -1,
     eps: float = 1e-6,
+    pt_transform: str = "linear",
+    pt_asinh_scale: float = 10.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     mode = str(mode).lower()
     eps = float(eps)
@@ -1108,7 +1668,8 @@ def estimate_target_transform(
 
     def get_y2(batch):
         y = batch["y_track"].view(3)
-        return y[:2]  # only ptq and eta are scaled here; phi handled separately
+        pt_encoded = encode_pt_target(y[0], mode=pt_transform, asinh_scale=pt_asinh_scale)
+        return torch.stack([pt_encoded, y[1]], dim=0)  # pt-like + eta; phi handled separately
 
     if mode == "standard":
         loader = _make_stats_loader(local_ds, num_workers=0)
@@ -1311,24 +1872,46 @@ def parse_three_floats(text: str) -> Tuple[float, float, float]:
 
 
 @torch.no_grad()
-def compute_metric_components(pred_metric: torch.Tensor, target_metric: torch.Tensor, phi_period: float) -> Dict[str, torch.Tensor]:
+def compute_metric_components(
+    pred_metric: torch.Tensor,
+    target_metric: torch.Tensor,
+    phi_period: float,
+    *,
+    low_pt_threshold: float = 100.0,
+    pt_mape_floor: float = 1.0,
+) -> Dict[str, torch.Tensor]:
+    """Metric sums over a batch of graphs in physical target space."""
+    if pred_metric.ndim != 2 or pred_metric.shape[1] != 3:
+        raise ValueError(f"pred_metric must have shape [B,3], got {tuple(pred_metric.shape)}")
+    if target_metric.shape != pred_metric.shape:
+        raise ValueError(
+            f"target_metric must match pred_metric shape {tuple(pred_metric.shape)}, "
+            f"got {tuple(target_metric.shape)}"
+        )
+
     diff = pred_metric - target_metric
     diff = diff.clone()
-    diff[2] = wrapped_angle_diff(pred_metric[2], target_metric[2], period=phi_period)
+    diff[:, 2] = wrapped_angle_diff(pred_metric[:, 2], target_metric[:, 2], period=phi_period)
 
     abs_err = diff.abs()
     sq_err = diff.pow(2)
 
-    pt_target = target_metric[0].abs().clamp(min=1e-6)
-    pt_mape = 100.0 * abs_err[0] / pt_target
+    physical_pt = target_metric[:, 0].abs()
+    pt_denom = physical_pt.clamp(min=max(float(pt_mape_floor), 1e-12))
+    pt_mape = 100.0 * abs_err[:, 0] / pt_denom
+    low_pt_mask = (physical_pt < float(low_pt_threshold)).to(torch.float64)
 
-    smape = 200.0 * abs_err / (pred_metric.abs() + target_metric.abs()).clamp(min=1e-6)
+    phi_denom = (pred_metric[:, 2].abs() + target_metric[:, 2].abs()).clamp(min=1e-6)
+    phi_smape = 200.0 * abs_err[:, 2] / phi_denom
 
     return {
-        "abs_err": abs_err.to(torch.float64),
-        "sq_err": sq_err.to(torch.float64),
-        "smape": smape.to(torch.float64),
-        "pt_mape": pt_mape.to(torch.float64),
+        "abs_err": abs_err.to(torch.float64).sum(dim=0),
+        "sq_err": sq_err.to(torch.float64).sum(dim=0),
+        "pt_mape": pt_mape.to(torch.float64).sum(),
+        "pt_low_mape_sum": (pt_mape.to(torch.float64) * low_pt_mask).sum(),
+        "low_pt_count": low_pt_mask.sum(),
+        "phi_smape": phi_smape.to(torch.float64).sum(),
+        "graph_count": torch.tensor(float(target_metric.shape[0]), device=target_metric.device, dtype=torch.float64),
     }
 
 
@@ -1337,14 +1920,20 @@ def build_train_targets(
     target_center_2: torch.Tensor,
     target_scale_2: torch.Tensor,
     phi_mode: str,
+    *,
+    pt_transform: str = "linear",
+    pt_asinh_scale: float = 10.0,
 ) -> Dict[str, torch.Tensor]:
+    if y.ndim != 2 or y.shape[1] != 3:
+        raise ValueError(f"y must have shape [B,3], got {tuple(y.shape)}")
+    pt_encoded = encode_pt_target(y[:, 0], mode=pt_transform, asinh_scale=pt_asinh_scale)
     out = {
-        "pt": (y[0] - target_center_2[0]) / target_scale_2[0],
-        "eta": (y[1] - target_center_2[1]) / target_scale_2[1],
+        "pt": (pt_encoded - target_center_2[0]) / target_scale_2[0],
+        "eta": (y[:, 1] - target_center_2[1]) / target_scale_2[1],
     }
-    phi = y[2]
+    phi = y[:, 2]
     if phi_mode == "sincos":
-        out["phi_target"] = torch.stack([torch.sin(phi), torch.cos(phi)], dim=0)
+        out["phi_target"] = torch.stack([torch.sin(phi), torch.cos(phi)], dim=-1)
     elif phi_mode == "scalar":
         out["phi_target"] = phi
     else:
@@ -1357,14 +1946,18 @@ def decode_prediction_to_metric(
     target_center_2: torch.Tensor,
     target_scale_2: torch.Tensor,
     phi_mode: str,
+    *,
+    pt_transform: str = "linear",
+    pt_asinh_scale: float = 10.0,
 ) -> torch.Tensor:
-    pt = pred_dict["pt"] * target_scale_2[0] + target_center_2[0]
+    pt_encoded = pred_dict["pt"] * target_scale_2[0] + target_center_2[0]
+    pt = decode_pt_target(pt_encoded, mode=pt_transform, asinh_scale=pt_asinh_scale)
     eta = pred_dict["eta"] * target_scale_2[1] + target_center_2[1]
     if phi_mode == "sincos":
         phi = angle_from_sincos(pred_dict["phi_raw"])
     else:
-        phi = pred_dict["phi_raw"].reshape(-1)[0]
-    return torch.stack([pt, eta, phi], dim=0)
+        phi = pred_dict["phi_raw"].squeeze(-1)
+    return torch.stack([pt, eta, phi], dim=-1)
 
 
 def compute_total_loss(
@@ -1375,25 +1968,63 @@ def compute_total_loss(
     *,
     loss_type: str,
     phi_mode: str,
+    phi_period: float,
     phi_vec_weight: float,
     target_weights: torch.Tensor,
+    pt_transform: str = "linear",
+    pt_asinh_scale: float = 10.0,
+    low_pt_threshold: float = 100.0,
+    low_pt_loss_weight: float = 2.0,
+    low_pt_relative_loss_weight: float = 0.25,
+    pt_relative_floor: float = 5.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    t = build_train_targets(y, target_center_2, target_scale_2, phi_mode)
+    t = build_train_targets(
+        y, target_center_2, target_scale_2, phi_mode,
+        pt_transform=pt_transform, pt_asinh_scale=pt_asinh_scale,
+    )
 
-    pt_loss = component_regression_loss(pred_dict["pt"] - t["pt"], loss_type=loss_type).mean()
-    eta_loss = component_regression_loss(pred_dict["eta"] - t["eta"], loss_type=loss_type).mean()
+    # Keep the existing loss definition, now evaluated per graph before reducing the batch.
+    pt_base_per_graph = component_regression_loss(
+        pred_dict["pt"] - t["pt"], loss_type=loss_type
+    )
+    physical_pt = y[:, 0].abs()
+    low_pt = (physical_pt < float(low_pt_threshold)).to(dtype=pt_base_per_graph.dtype)
+    region_weight = 1.0 + (float(low_pt_loss_weight) - 1.0) * low_pt
+
+    pred_pt_encoded = pred_dict["pt"] * target_scale_2[0] + target_center_2[0]
+    pred_pt_metric = decode_pt_target(pred_pt_encoded, mode=pt_transform, asinh_scale=pt_asinh_scale)
+    rel_denom = physical_pt.clamp(min=max(float(pt_relative_floor), 1e-6))
+    pt_rel_diff = (pred_pt_metric - y[:, 0]) / rel_denom
+    pt_relative_per_graph = component_regression_loss(pt_rel_diff, loss_type=loss_type)
+    pt_per_graph = (
+        region_weight * pt_base_per_graph
+        + low_pt * float(low_pt_relative_loss_weight) * pt_relative_per_graph
+    )
+    pt_loss = pt_per_graph.mean()
+    pt_base_loss = pt_base_per_graph.mean()
+    pt_relative_loss = pt_relative_per_graph.mean()
+
+    eta_per_graph = component_regression_loss(pred_dict["eta"] - t["eta"], loss_type=loss_type)
+    eta_loss = eta_per_graph.mean()
 
     if phi_mode == "sincos":
-        phi_pred = F.normalize(pred_dict["phi_raw"], dim=0)
+        phi_pred = F.normalize(pred_dict["phi_raw"], dim=-1)
         phi_loss_vec = component_regression_loss(phi_pred - t["phi_target"], loss_type=loss_type)
-        phi_loss = phi_vec_weight * phi_loss_vec.mean()
+        phi_per_graph = float(phi_vec_weight) * phi_loss_vec.mean(dim=-1)
+        phi_loss = phi_per_graph.mean()
     else:
-        diff_phi = wrapped_angle_diff(pred_dict["phi_raw"].reshape(-1)[0], t["phi_target"], period=2.0 * math.pi)
-        phi_loss = component_regression_loss(diff_phi, loss_type=loss_type).mean()
+        diff_phi = wrapped_angle_diff(
+            pred_dict["phi_raw"].squeeze(-1), t["phi_target"], period=phi_period
+        )
+        phi_per_graph = component_regression_loss(diff_phi, loss_type=loss_type)
+        phi_loss = phi_per_graph.mean()
 
     total = target_weights[0] * pt_loss + target_weights[1] * eta_loss + target_weights[2] * phi_loss
     pieces = {
         "loss_pt": pt_loss.detach(),
+        "loss_pt_base": pt_base_loss.detach(),
+        "loss_pt_relative": pt_relative_loss.detach(),
+        "low_pt": low_pt.mean().detach(),
         "loss_eta": eta_loss.detach(),
         "loss_phi": phi_loss.detach(),
     }
@@ -1479,6 +2110,20 @@ def main():
 
     ap.add_argument("--layer-type", default="mpnn", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"])
     ap.add_argument("--gat-heads", type=int, default=4)
+    ap.add_argument("--gat-edge-attn", action="store_true", default=False,
+                    help="Use edge_attr through a normalized edge encoder in baseline GAT attention logits.")
+    ap.add_argument("--no-gat-edge-attn", dest="gat_edge_attn", action="store_false")
+    ap.add_argument(
+        "--gatv2-edge-attn",
+        action="store_true",
+        default=True,
+        help=(
+            "Use nonlinear source-destination-edge GATv2 attention and edge-conditioned "
+            "messages. This is the recommended/default GAT mode, matching the "
+            "DisplacedVertex architecture."
+        ),
+    )
+    ap.add_argument("--no-gatv2-edge-attn", dest="gatv2_edge_attn", action="store_false")
     ap.add_argument("--sage-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--edgeconv-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--graph-pool", default="meanmax", choices=["mean", "max", "meanmax"])
@@ -1487,6 +2132,20 @@ def main():
     ap.add_argument("--target-scale", choices=["none", "standard", "robust", "minmax"], default="robust")
     ap.add_argument("--target-scale-eps", type=float, default=1e-6)
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
+    ap.add_argument("--pt-transform", choices=["linear", "asinh"], default="asinh",
+                    help="Transform the signed pt-like target before centering/scaling; asinh compresses the high-pt tail.")
+    ap.add_argument("--pt-asinh-scale", type=float, default=10.0,
+                    help="GeV-like scale for asinh(pt/scale). Only used with --pt-transform=asinh.")
+    ap.add_argument("--low-pt-threshold", type=float, default=100.0,
+                    help="Physical |pt-like| threshold used for low-pt weighting and metrics.")
+    ap.add_argument("--low-pt-loss-weight", type=float, default=2.0,
+                    help="Multiplier on the base pt loss for truth |pt| below --low-pt-threshold.")
+    ap.add_argument("--low-pt-relative-loss-weight", type=float, default=0.25,
+                    help="Weight of an auxiliary relative pt loss, active only below the low-pt threshold.")
+    ap.add_argument("--pt-relative-floor", type=float, default=5.0,
+                    help="Denominator floor for the low-pt relative training loss.")
+    ap.add_argument("--pt-mape-floor", type=float, default=1.0,
+                    help="Denominator floor for reported pt MAPE/low-pt MAPE.")
 
     ap.add_argument("--phi-mode", default="sincos", choices=["sincos", "scalar"], help="Use sin/cos head for phi by default.")
     ap.add_argument("--phi-period", type=float, default=(2.0 * math.pi))
@@ -1499,6 +2158,7 @@ def main():
     ap.add_argument("--time", action="store_true", default=True)
     ap.add_argument("--no-time", dest="time", action="store_false")
 
+    ap.add_argument("--batch-size", type=int, default=16, help="Number of independent graphs per GPU per optimizer step.")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--pin-memory", action="store_true", default=True)
     ap.add_argument("--prefetch-factor", type=int, default=2)
@@ -1521,7 +2181,11 @@ def main():
     ap.add_argument("--no-early-stop", dest="early_stop", action="store_false")
     ap.add_argument("--early-stop-patience", type=int, default=30)
     ap.add_argument("--early-stop-min-delta", type=float, default=0.0)
-    ap.add_argument("--early-stop-monitor", choices=["val_loss", "val_rmse_mean"], default="val_loss")
+    ap.add_argument(
+        "--early-stop-monitor",
+        choices=["val_loss", "val_rmse_mean", "val_pt_mape", "val_pt_low_mape", "val_eta_mae", "val_phi_smape"],
+        default="val_pt_low_mape",
+    )
 
     ap.add_argument("--lr-schedule", choices=["plateau", "cosine"], default="plateau")
     ap.add_argument("--lr-plateau-factor", type=float, default=0.5)
@@ -1570,11 +2234,29 @@ def main():
 
     args = ap.parse_args()
 
+    if args.gat_edge_attn and args.gatv2_edge_attn:
+        raise SystemExit(
+            "--gat-edge-attn and --gatv2-edge-attn select different GAT attention modes; "
+            "choose at most one."
+        )
+    if args.gat_edge_attn and args.layer_type != "gat_residual":
+        raise SystemExit("--gat-edge-attn requires --layer-type gat_residual")
+    if args.layer_type != "gat_residual":
+        # Attention-mode flags are irrelevant for the other architecture families.
+        # Keep checkpoint metadata unambiguous instead of recording the GATv2 default.
+        args.gat_edge_attn = False
+        args.gatv2_edge_attn = False
+
+    if int(args.batch_size) < 1:
+        raise SystemExit(f"--batch-size must be >= 1, got {args.batch_size}")
+
     try:
         faulthandler.enable(all_threads=True)
         faulthandler.register(signal.SIGBUS, all_threads=True, chain=True)
     except Exception:
         pass
+
+    _install_termination_signal_handlers()
 
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
     torch.set_num_interop_threads(int(os.environ.get("TORCH_INTEROP_THREADS", "1")))
@@ -1628,7 +2310,7 @@ def main():
 
     index_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with timed_section("dataset_index", device=index_device, enabled=args.time) as tt:
-        ds = H5TrackGraphDataset(
+        ds = _register_runtime_dataset(H5TrackGraphDataset(
             paths,
             h5_index_retries=args.h5_index_retries,
             h5_index_retry_sleep=args.h5_index_retry_sleep,
@@ -1640,7 +2322,7 @@ def main():
             h5_close_after_read=args.h5_close_after_read,
             h5_swmr=args.h5_swmr,
             bad_graphs_file=args.bad_graphs_file,
-        )
+        ))
     if ddp_is_main() and args.time:
         print(f"[time] dataset indexing: {tt['seconds']:.3f}s (rank0)")
 
@@ -1648,11 +2330,7 @@ def main():
     train_idx = split["train_idx"].astype(np.int64)
     val_idx = split["val_idx"].astype(np.int64)
 
-    if "h5_paths" in split.files:
-        saved_paths = [str(p) for p in split["h5_paths"].tolist()]
-        cur_paths = [str(Path(p).resolve()) for p in paths]
-        if saved_paths != cur_paths:
-            raise RuntimeError("Split file appears to be for different H5 files or ordering. Regenerate split.")
+    _validate_split_compatibility(split, current_paths=paths, ds=ds)
 
     n = len(ds)
     if train_idx.size == 0 or val_idx.size == 0:
@@ -1682,6 +2360,10 @@ def main():
     if ddp_is_main():
         print(f"[i] ddp world_size={ddp_world_size()} device={device}")
         print(f"[i] graphs: train={len(train_ds)} val={len(val_ds)} total={len(ds)} split={args.split_file}")
+        print(
+            f"[i] batch_size_per_gpu={args.batch_size} "
+            f"effective_global_batch={int(args.batch_size) * ddp_world_size()}"
+        )
 
     xdim, edim, ydim = infer_dims_from_subset(train_ds)
     ds._close_files()
@@ -1699,6 +2381,8 @@ def main():
         dropout=args.dropout,
         layer_type=args.layer_type,
         gat_heads=args.gat_heads,
+        gat_edge_attn=args.gat_edge_attn,
+        gatv2_edge_attn=args.gatv2_edge_attn,
         sage_aggr=args.sage_aggr,
         edgeconv_aggr=args.edgeconv_aggr,
         use_fourier=args.fourier,
@@ -1750,6 +2434,8 @@ def main():
         mode=args.target_scale,
         max_events=args.target_stats_max_events,
         eps=args.target_scale_eps,
+        pt_transform=args.pt_transform,
+        pt_asinh_scale=args.pt_asinh_scale,
     )
     ds._close_files()
 
@@ -1757,13 +2443,17 @@ def main():
 
     if ddp_is_main():
         print(f"[i] target_scale_mode={args.target_scale}", flush=True)
-        print(f"[i] target_center_linear={target_center_2.detach().cpu().numpy()}  # [ptq, eta]", flush=True)
-        print(f"[i] target_scale_linear ={target_scale_2.detach().cpu().numpy()}  # [ptq, eta]", flush=True)
+        print(f"[i] pt_transform={args.pt_transform} pt_asinh_scale={args.pt_asinh_scale}", flush=True)
+        print(f"[i] target_center_linear={target_center_2.detach().cpu().numpy()}  # [encoded_pt, eta]", flush=True)
+        print(f"[i] target_scale_linear ={target_scale_2.detach().cpu().numpy()}  # [encoded_pt, eta]", flush=True)
+        print(f"[i] low_pt: threshold={args.low_pt_threshold} loss_weight={args.low_pt_loss_weight} "
+              f"relative_weight={args.low_pt_relative_loss_weight} relative_floor={args.pt_relative_floor} "
+              f"mape_floor={args.pt_mape_floor}", flush=True)
         print(f"[i] phi_mode={args.phi_mode} phi_period={args.phi_period}", flush=True)
         print(f"[i] target_loss_weights={target_weights.detach().cpu().tolist()}", flush=True)
 
     loader_kwargs = {
-        "collate_fn": collate_one,
+        "collate_fn": collate_graphs,
         "num_workers": int(args.num_workers),
         "pin_memory": args.pin_memory,
     }
@@ -1775,20 +2465,20 @@ def main():
             worker_init_fn=h5_worker_init_fn,
         )
 
-    train_loader = DataLoader(
+    train_loader = _register_runtime_dataloader(DataLoader(
         train_ds,
-        batch_size=1,
+        batch_size=int(args.batch_size),
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         **loader_kwargs,
-    )
-    val_loader = DataLoader(
+    ))
+    val_loader = _register_runtime_dataloader(DataLoader(
         val_ds,
-        batch_size=1,
+        batch_size=int(args.batch_size),
         shuffle=False,
         sampler=val_sampler,
         **loader_kwargs,
-    )
+    ))
 
     if ddp_is_initialized():
         if len(train_loader) == 0:
@@ -1816,6 +2506,7 @@ def main():
             "target_center_linear": target_center_2.detach().cpu().tolist(),
             "target_scale_linear": target_scale_2.detach().cpu().tolist(),
             "target_labels": ["pt_like", "eta", "phi"],
+            "comparison_metrics": ["pt_low_mape", "eta_mae", "phi_smape"],
             "xdim": xdim,
             "edim": edim,
         }
@@ -1882,11 +2573,14 @@ def main():
         model.train()
         train_loss = torch.tensor(0.0, device=device)
         train_steps = torch.tensor(0.0, device=device)
+        train_graphs = torch.tensor(0.0, device=device, dtype=torch.float64)
         train_loss_parts = torch.zeros(3, device=device, dtype=torch.float64)
         train_abs_err = torch.zeros(3, device=device, dtype=torch.float64)
         train_sq_err = torch.zeros(3, device=device, dtype=torch.float64)
-        train_smape_sum = torch.zeros(3, device=device, dtype=torch.float64)
         train_pt_mape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
+        train_pt_low_mape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
+        train_low_pt_count = torch.tensor(0.0, device=device, dtype=torch.float64)
+        train_phi_smape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
 
         with timed_section("train_epoch_total", device, enabled=args.time):
             for batch in train_loader:
@@ -1896,6 +2590,7 @@ def main():
                     x = batch["x"]
                     edge_index = batch["edge_index"]
                     edge_attr = batch["edge_attr"]
+                    batch_index = batch["batch_index"]
                     y = batch["y_track"].float()
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
@@ -1919,7 +2614,10 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 try:
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=args.edge_dropout)
+                        pred_dict = model(
+                            x, edge_index, edge_attr, batch_index, int(y.shape[0]),
+                            edge_dropout_p=args.edge_dropout,
+                        )
                         loss, pieces = compute_total_loss(
                             pred_dict,
                             y,
@@ -1927,8 +2625,15 @@ def main():
                             target_scale_2,
                             loss_type=args.loss_type,
                             phi_mode=args.phi_mode,
+                            phi_period=args.phi_period,
                             phi_vec_weight=args.phi_vec_weight,
                             target_weights=target_weights,
+                            pt_transform=args.pt_transform,
+                            pt_asinh_scale=args.pt_asinh_scale,
+                            low_pt_threshold=args.low_pt_threshold,
+                            low_pt_loss_weight=args.low_pt_loss_weight,
+                            low_pt_relative_loss_weight=args.low_pt_relative_loss_weight,
+                            pt_relative_floor=args.pt_relative_floor,
                         )
 
                     if not torch.isfinite(loss):
@@ -1958,18 +2663,31 @@ def main():
                 if args.lr_schedule == "cosine":
                     scheduler.step()
 
-                train_loss += loss.detach()
+                batch_graphs = float(y.shape[0])
+                train_loss += loss.detach() * batch_graphs
                 train_steps += 1.0
-                train_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+                train_graphs += batch_graphs
+                train_loss_parts += (
+                    torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+                    * batch_graphs
+                )
 
-                pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
-                metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
+                pred_metric = decode_prediction_to_metric(
+                    pred_dict, target_center_2, target_scale_2, args.phi_mode,
+                    pt_transform=args.pt_transform, pt_asinh_scale=args.pt_asinh_scale,
+                )
+                metric_parts = compute_metric_components(
+                    pred_metric, y, args.phi_period,
+                    low_pt_threshold=args.low_pt_threshold, pt_mape_floor=args.pt_mape_floor,
+                )
                 train_abs_err += metric_parts["abs_err"]
                 train_sq_err += metric_parts["sq_err"]
-                train_smape_sum += metric_parts["smape"]
                 train_pt_mape_sum += metric_parts["pt_mape"]
+                train_pt_low_mape_sum += metric_parts["pt_low_mape_sum"]
+                train_low_pt_count += metric_parts["low_pt_count"]
+                train_phi_smape_sum += metric_parts["phi_smape"]
 
-                del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
+                del x, edge_index, edge_attr, batch_index, y, pred_dict, loss, pieces, pred_metric, metric_parts
 
         gc.collect()
         if device.type == "cuda":
@@ -1977,28 +2695,36 @@ def main():
 
         ddp_all_reduce_sum(train_loss)
         ddp_all_reduce_sum(train_steps)
+        ddp_all_reduce_sum(train_graphs)
         ddp_all_reduce_sum(train_loss_parts)
         ddp_all_reduce_sum(train_abs_err)
         ddp_all_reduce_sum(train_sq_err)
-        ddp_all_reduce_sum(train_smape_sum)
         ddp_all_reduce_sum(train_pt_mape_sum)
+        ddp_all_reduce_sum(train_pt_low_mape_sum)
+        ddp_all_reduce_sum(train_low_pt_count)
+        ddp_all_reduce_sum(train_phi_smape_sum)
 
-        train_loss_mean = (train_loss / torch.clamp(train_steps, min=1.0)).item()
-        train_loss_parts_mean = (train_loss_parts / torch.clamp(train_steps, min=1.0)).cpu().numpy()
-        train_mae = (train_abs_err / torch.clamp(train_steps, min=1.0)).cpu().numpy()
-        train_rmse = torch.sqrt(train_sq_err / torch.clamp(train_steps, min=1.0)).cpu().numpy()
-        train_smape = (train_smape_sum / torch.clamp(train_steps, min=1.0)).cpu().numpy()
-        train_pt_mape = (train_pt_mape_sum / torch.clamp(train_steps, min=1.0)).item()
+        train_loss_mean = (train_loss / torch.clamp(train_graphs, min=1.0)).item()
+        train_loss_parts_mean = (train_loss_parts / torch.clamp(train_graphs, min=1.0)).cpu().numpy()
+        train_mae = (train_abs_err / torch.clamp(train_graphs, min=1.0)).cpu().numpy()
+        train_rmse = torch.sqrt(train_sq_err / torch.clamp(train_graphs, min=1.0)).cpu().numpy()
+        train_pt_mape = (train_pt_mape_sum / torch.clamp(train_graphs, min=1.0)).item()
+        train_low_pt_n = int(round(train_low_pt_count.item()))
+        train_pt_low_mape = (train_pt_low_mape_sum / train_low_pt_count).item() if train_low_pt_n > 0 else float("nan")
+        train_phi_smape = (train_phi_smape_sum / torch.clamp(train_graphs, min=1.0)).item()
         train_rmse_mean = float(np.mean(train_rmse))
 
         model.eval()
         val_loss = torch.tensor(0.0, device=device)
         val_steps = torch.tensor(0.0, device=device)
+        val_graphs = torch.tensor(0.0, device=device, dtype=torch.float64)
         val_loss_parts = torch.zeros(3, device=device, dtype=torch.float64)
         val_abs_err = torch.zeros(3, device=device, dtype=torch.float64)
         val_sq_err = torch.zeros(3, device=device, dtype=torch.float64)
-        val_smape_sum = torch.zeros(3, device=device, dtype=torch.float64)
         val_pt_mape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
+        val_pt_low_mape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
+        val_low_pt_count = torch.tensor(0.0, device=device, dtype=torch.float64)
+        val_phi_smape_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
 
         eval_ctx = ema.apply_to(model) if ema is not None else nullcontext()
         with eval_ctx:
@@ -2010,6 +2736,7 @@ def main():
                         x = batch["x"]
                         edge_index = batch["edge_index"]
                         edge_attr = batch["edge_attr"]
+                        batch_index = batch["batch_index"]
                         y = batch["y_track"].float()
                         if device.type == "cuda":
                             torch.cuda.synchronize(device)
@@ -2019,7 +2746,10 @@ def main():
                         fail_fast_bad_batch(batch, e, where="val/load_or_h2d")
 
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        pred_dict = model(x, edge_index, edge_attr, edge_dropout_p=0.0)
+                        pred_dict = model(
+                            x, edge_index, edge_attr, batch_index, int(y.shape[0]),
+                            edge_dropout_p=0.0,
+                        )
                         loss, pieces = compute_total_loss(
                             pred_dict,
                             y,
@@ -2027,8 +2757,15 @@ def main():
                             target_scale_2,
                             loss_type=args.loss_type,
                             phi_mode=args.phi_mode,
+                            phi_period=args.phi_period,
                             phi_vec_weight=args.phi_vec_weight,
                             target_weights=target_weights,
+                            pt_transform=args.pt_transform,
+                            pt_asinh_scale=args.pt_asinh_scale,
+                            low_pt_threshold=args.low_pt_threshold,
+                            low_pt_loss_weight=args.low_pt_loss_weight,
+                            low_pt_relative_loss_weight=args.low_pt_relative_loss_weight,
+                            pt_relative_floor=args.pt_relative_floor,
                         )
 
                     if not torch.isfinite(loss):
@@ -2036,18 +2773,31 @@ def main():
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
 
-                    pred_metric = decode_prediction_to_metric(pred_dict, target_center_2, target_scale_2, args.phi_mode)
-                    metric_parts = compute_metric_components(pred_metric, y, args.phi_period)
+                    pred_metric = decode_prediction_to_metric(
+                        pred_dict, target_center_2, target_scale_2, args.phi_mode,
+                        pt_transform=args.pt_transform, pt_asinh_scale=args.pt_asinh_scale,
+                    )
+                    metric_parts = compute_metric_components(
+                        pred_metric, y, args.phi_period,
+                        low_pt_threshold=args.low_pt_threshold, pt_mape_floor=args.pt_mape_floor,
+                    )
 
-                    val_loss += loss.detach()
+                    batch_graphs = float(y.shape[0])
+                    val_loss += loss.detach() * batch_graphs
                     val_steps += 1.0
-                    val_loss_parts += torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+                    val_graphs += batch_graphs
+                    val_loss_parts += (
+                        torch.stack([pieces["loss_pt"], pieces["loss_eta"], pieces["loss_phi"]]).to(torch.float64)
+                        * batch_graphs
+                    )
                     val_abs_err += metric_parts["abs_err"]
                     val_sq_err += metric_parts["sq_err"]
-                    val_smape_sum += metric_parts["smape"]
                     val_pt_mape_sum += metric_parts["pt_mape"]
+                    val_pt_low_mape_sum += metric_parts["pt_low_mape_sum"]
+                    val_low_pt_count += metric_parts["low_pt_count"]
+                    val_phi_smape_sum += metric_parts["phi_smape"]
 
-                    del x, edge_index, edge_attr, y, pred_dict, loss, pieces, pred_metric, metric_parts
+                    del x, edge_index, edge_attr, batch_index, y, pred_dict, loss, pieces, pred_metric, metric_parts
 
         gc.collect()
         if device.type == "cuda":
@@ -2055,37 +2805,50 @@ def main():
 
         ddp_all_reduce_sum(val_loss)
         ddp_all_reduce_sum(val_steps)
+        ddp_all_reduce_sum(val_graphs)
         ddp_all_reduce_sum(val_loss_parts)
         ddp_all_reduce_sum(val_abs_err)
         ddp_all_reduce_sum(val_sq_err)
-        ddp_all_reduce_sum(val_smape_sum)
         ddp_all_reduce_sum(val_pt_mape_sum)
+        ddp_all_reduce_sum(val_pt_low_mape_sum)
+        ddp_all_reduce_sum(val_low_pt_count)
+        ddp_all_reduce_sum(val_phi_smape_sum)
 
-        val_loss_mean = (val_loss / torch.clamp(val_steps, min=1.0)).item()
-        val_loss_parts_mean = (val_loss_parts / torch.clamp(val_steps, min=1.0)).cpu().numpy()
-        val_mae = (val_abs_err / torch.clamp(val_steps, min=1.0)).cpu().numpy()
-        val_rmse = torch.sqrt(val_sq_err / torch.clamp(val_steps, min=1.0)).cpu().numpy()
-        val_smape = (val_smape_sum / torch.clamp(val_steps, min=1.0)).cpu().numpy()
-        val_pt_mape = (val_pt_mape_sum / torch.clamp(val_steps, min=1.0)).item()
+        val_loss_mean = (val_loss / torch.clamp(val_graphs, min=1.0)).item()
+        val_loss_parts_mean = (val_loss_parts / torch.clamp(val_graphs, min=1.0)).cpu().numpy()
+        val_mae = (val_abs_err / torch.clamp(val_graphs, min=1.0)).cpu().numpy()
+        val_rmse = torch.sqrt(val_sq_err / torch.clamp(val_graphs, min=1.0)).cpu().numpy()
+        val_pt_mape = (val_pt_mape_sum / torch.clamp(val_graphs, min=1.0)).item()
+        val_low_pt_n = int(round(val_low_pt_count.item()))
+        val_pt_low_mape = (val_pt_low_mape_sum / val_low_pt_count).item() if val_low_pt_n > 0 else float("nan")
+        val_phi_smape = (val_phi_smape_sum / torch.clamp(val_graphs, min=1.0)).item()
         val_rmse_mean = float(np.mean(val_rmse))
 
         if args.lr_schedule == "plateau":
             scheduler.step(val_loss_mean)
         current_lr = opt.param_groups[0]["lr"]
 
-        monitor_val = val_loss_mean if args.early_stop_monitor == "val_loss" else val_rmse_mean
-        improved = best_monitor is None or monitor_val < best_monitor - args.early_stop_min_delta
+        monitor_values = {
+            "val_loss": val_loss_mean,
+            "val_rmse_mean": val_rmse_mean,
+            "val_pt_mape": val_pt_mape,
+            "val_pt_low_mape": val_pt_low_mape,
+            "val_eta_mae": float(val_mae[1]),
+            "val_phi_smape": val_phi_smape,
+        }
+        monitor_val = float(monitor_values[args.early_stop_monitor])
+        improved = math.isfinite(monitor_val) and (best_monitor is None or monitor_val < best_monitor - args.early_stop_min_delta)
 
         if ddp_is_main():
             print(
                 f"[epoch {epoch:03d}] "
                 f"train loss={train_loss_mean:.5f} parts=({train_loss_parts_mean[0]:.5f},{train_loss_parts_mean[1]:.5f},{train_loss_parts_mean[2]:.5f}) "
-                f"mae=({train_mae[0]:.4f},{train_mae[1]:.4f},{train_mae[2]:.4f}) "
-                f"smape=({train_smape[0]:.2f}%,{train_smape[1]:.2f}%,{train_smape[2]:.2f}%) ptq_mape={train_pt_mape:.2f}% "
+                f"pt_mape={train_pt_mape:.2f}% pt_low_mape={train_pt_low_mape:.2f}% low_pt_n={train_low_pt_n} "
+                f"eta_mae={train_mae[1]:.5f} eta_rmse={train_rmse[1]:.5f} phi_smape={train_phi_smape:.2f}% "
                 f"rmse_mean={train_rmse_mean:.4f} | "
                 f"val loss={val_loss_mean:.5f} parts=({val_loss_parts_mean[0]:.5f},{val_loss_parts_mean[1]:.5f},{val_loss_parts_mean[2]:.5f}) "
-                f"mae=({val_mae[0]:.4f},{val_mae[1]:.4f},{val_mae[2]:.4f}) "
-                f"smape=({val_smape[0]:.2f}%,{val_smape[1]:.2f}%,{val_smape[2]:.2f}%) ptq_mape={val_pt_mape:.2f}% "
+                f"pt_mape={val_pt_mape:.2f}% pt_low_mape={val_pt_low_mape:.2f}% low_pt_n={val_low_pt_n} "
+                f"eta_mae={val_mae[1]:.5f} eta_rmse={val_rmse[1]:.5f} phi_smape={val_phi_smape:.2f}% "
                 f"rmse_mean={val_rmse_mean:.4f} | "
                 f"lr={current_lr:.3e} | "
                 f"{args.early_stop_monitor}={monitor_val:.6f} {'(best)' if improved else ''}"
@@ -2102,10 +2865,10 @@ def main():
                     "train/mae_ptq": float(train_mae[0]),
                     "train/mae_eta": float(train_mae[1]),
                     "train/mae_phi": float(train_mae[2]),
-                    "train/smape_ptq": float(train_smape[0]),
-                    "train/smape_eta": float(train_smape[1]),
-                    "train/smape_phi": float(train_smape[2]),
                     "train/ptq_mape": float(train_pt_mape),
+                    "train/ptq_low_mape": float(train_pt_low_mape),
+                    "train/low_pt_n": int(train_low_pt_n),
+                    "train/phi_smape": float(train_phi_smape),
                     "train/rmse_ptq": float(train_rmse[0]),
                     "train/rmse_eta": float(train_rmse[1]),
                     "train/rmse_phi": float(train_rmse[2]),
@@ -2117,10 +2880,10 @@ def main():
                     "val/mae_ptq": float(val_mae[0]),
                     "val/mae_eta": float(val_mae[1]),
                     "val/mae_phi": float(val_mae[2]),
-                    "val/smape_ptq": float(val_smape[0]),
-                    "val/smape_eta": float(val_smape[1]),
-                    "val/smape_phi": float(val_smape[2]),
                     "val/ptq_mape": float(val_pt_mape),
+                    "val/ptq_low_mape": float(val_pt_low_mape),
+                    "val/low_pt_n": int(val_low_pt_n),
+                    "val/phi_smape": float(val_phi_smape),
                     "val/rmse_ptq": float(val_rmse[0]),
                     "val/rmse_eta": float(val_rmse[1]),
                     "val/rmse_phi": float(val_rmse[2]),
@@ -2148,9 +2911,12 @@ def main():
                     "dropout": args.dropout,
                     "layer_type": args.layer_type,
                     "gat_heads": args.gat_heads,
+                    "gat_edge_attn": args.gat_edge_attn,
+                    "gatv2_edge_attn": args.gatv2_edge_attn,
                     "sage_aggr": args.sage_aggr,
                     "edgeconv_aggr": args.edgeconv_aggr,
                     "graph_pool": args.graph_pool,
+                    "batch_size": int(args.batch_size),
                     "loss_type": args.loss_type,
                     "fourier": args.fourier,
                     "fourier_base": args.fourier_base,
@@ -2160,6 +2926,19 @@ def main():
                     "target_scale_eps": args.target_scale_eps,
                     "target_center_linear": target_center_2.detach().cpu(),
                     "target_scale_linear": target_scale_2.detach().cpu(),
+                    "pt_transform": args.pt_transform,
+                    "pt_asinh_scale": args.pt_asinh_scale,
+                    "low_pt_threshold": args.low_pt_threshold,
+                    "low_pt_loss_weight": args.low_pt_loss_weight,
+                    "low_pt_relative_loss_weight": args.low_pt_relative_loss_weight,
+                    "pt_relative_floor": args.pt_relative_floor,
+                    "pt_mape_floor": args.pt_mape_floor,
+                    "val_pt_mape": val_pt_mape,
+                    "val_pt_low_mape": val_pt_low_mape,
+                    "val_low_pt_n": val_low_pt_n,
+                    "val_eta_mae": float(val_mae[1]),
+                    "val_eta_rmse": float(val_rmse[1]),
+                    "val_phi_smape": val_phi_smape,
                     "phi_mode": args.phi_mode,
                     "phi_period": args.phi_period,
                     "target_loss_weights": target_weights.detach().cpu(),
@@ -2245,7 +3024,25 @@ def main():
 
 
 if __name__ == "__main__":
+    _exit_code = 0
     try:
         main()
+    except _GracefulTermination as e:
+        _exit_code = 128 + int(e.signum)
+        try:
+            rank = ddp_rank()
+        except Exception:
+            rank = 0
+        print(f"[shutdown] rank={rank} received signal {e.signum}; cleaning DataLoader workers and DDP.", flush=True)
+    except KeyboardInterrupt:
+        # Fallback for an interrupt that arrives before our handlers are installed.
+        _exit_code = 128 + int(signal.SIGINT)
+        print("[shutdown] KeyboardInterrupt; cleaning DataLoader workers and DDP.", flush=True)
     finally:
+        # Ordering matters: pin-memory threads/workers can still own multiprocessing
+        # queues/semaphores.  Stop them before destroying the NCCL process group.
+        _cleanup_runtime_resources()
         ddp_cleanup()
+
+    if _exit_code:
+        raise SystemExit(_exit_code)

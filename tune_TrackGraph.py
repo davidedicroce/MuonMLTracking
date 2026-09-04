@@ -3,33 +3,34 @@
 Two-phase Optuna tuner for train_TrackGraph.py (track-parameter GNN regressor).
 
 This is adapted from tune_SegmentClassifier_optuna.py, but the objective is regression:
-minimize overall validation SMAPE across the three target components:
-  y_track = [ptq, eta, phi]
+prioritize validation MAPE in the low-pt regime while comparing targets with
+metric-appropriate quantities:
+  y_track = [ptq, eta, phi] -> [low-pt MAPE, eta MAE, phi SMAPE]
 
 Important:
-- train_TrackGraph.py prints validation SMAPE per epoch, but the checkpoint does not
-  currently store val_smape_ptq/eta/phi. This tuner therefore parses the trainer log
-  and uses the best observed validation mean SMAPE as the Optuna objective.
-- The trainer checkpoint is still selected by train_TrackGraph.py according to its
-  own --early-stop-monitor, usually val_loss. If you want the saved checkpoint to
-  correspond exactly to best SMAPE, add SMAPE checkpoint metadata/monitoring to the
-  trainer. For tuning/ranking, this script uses the log-derived SMAPE.
+- train_TrackGraph.py prints low-pt MAPE, eta MAE and phi SMAPE per epoch.
+  The default Optuna objective is low-pt MAPE; an optional normalized balanced
+  objective keeps low-pt performance dominant while retaining eta/phi quality.
+- The patched trainer supports --early-stop-monitor=val_pt_low_mape, which is the
+  default here so the saved checkpoint is aligned with the primary Optuna objective.
+- Start a new Optuna study/database when switching from the old all-SMAPE objective;
+  objective values from the two definitions are not comparable.
 
 Example:
 python tune_TrackGraph.py \
   --train-script ./train_TrackGraph.py \
-  --data-glob "./data/track_graph_part*.h5" \
-  --split-file "./data/split_track_graph_seed12345.npz" \
-  --out-dir "./tuning_track_graph_smape" \
-  --storage-path "/shared/wp2p5/sqlite/optuna_track_graph_smape.db" \
-  --study-name "track_graph_mean_smape" \
-  --n-trials 80 \
+  --data-glob "/shared/wp2p5/data/tracks_mu200/data_track_graphs_mu200_part*.h5" \
+  --split-file "/shared/wp2p5/data/tracks_mu200/split_track_graphs_mu200_seed12345.npz" \
+  --out-dir "./tuning_track_graph_smape_mu200" \
+  --storage-path "/shared/wp2p5/sqlite/optuna_track_graph_smape_mu200.db" \
+  --study-name "track_graph_mean_smape_mu200" \
+  --n-trials 100 \
   --fast-gpus-per-trial 2 \
   --n-jobs 4 \
-  --fast-epochs 40 \
-  --fast-max-train-graphs 20000 \
+  --fast-epochs 60 \
+  --fast-max-train-graphs 100000 \
   --refit-topk 5 \
-  --refit-epochs 200 \
+  --refit-epochs 250 \
   --refit-max-train-graphs -1 \
   --num-workers 4 \
   --pin-memory \
@@ -38,18 +39,39 @@ python tune_TrackGraph.py \
 Run a separate architecture-family study:
 python tune_TrackGraph.py \
   --train-script ./train_TrackGraph.py \
-  --data-glob "./data/track_graph_part*.h5" \
-  --split-file "./data/split_track_graph_seed12345.npz" \
-  --out-dir "./tuning_track_graph_mpnn" \
-  --storage-path "/shared/wp2p5/sqlite/optuna_track_graph_mpnn.db" \
-  --study-name "track_graph_smape_mpnn" \
+  --data-glob "/shared/wp2p5/data/tracks_mu200/data_track_graphs_mu200_part*.h5" \
+  --split-file "/shared/wp2p5/data/tracks_mu200/split_track_graphs_mu200_seed12345.npz" \
+  --out-dir "./tuning_track_graph_mpnn_mu200_lowpt" \
+  --storage-path "/shared/wp2p5/sqlite/optuna_track_graph_mpnn_mu200_lowpt.db" \
+  --study-name "track_graph_mpnn_mu200_lowpt" \
   --fixed-layer-type mpnn \
-  --n-trials 80 \
+  --n-trials 100 \
   --fast-gpus-per-trial 2 \
   --n-jobs 4 \
+  --fast-epochs 60 \
+  --fast-max-train-graphs 100000 \
   --num-workers 4 \
   --pin-memory \
-  --wandb-mode disabled
+  --wandb-mode disabled  2>&1 | tee log_tune_track_mpnn_mu200_lowpt.txt
+  
+python tune_TrackGraph.py \
+  --train-script ./train_TrackGraph.py \
+  --data-glob "/shared/wp2p5/data/tracks_mu200/data_track_graphs_mu200_part*.h5" \
+  --split-file "/shared/wp2p5/data/tracks_mu200/split_track_graphs_mu200_seed12345.npz" \
+  --out-dir "./tuning_track_graph_gatv2_mu200_lowpt" \
+  --storage-path "/shared/wp2p5/sqlite/optuna_track_graph_gatv2_mu200_lowpt.db" \
+  --study-name "track_graph_gatv2_mu200_lowpt" \
+  --fixed-layer-type gat_residual \
+  --gatv2-edge-attn \
+  --n-trials 100 \
+  --fast-gpus-per-trial 2 \
+  --n-jobs 4 \
+  --fast-epochs 60 \
+  --fast-max-train-graphs 100000 \
+  --num-workers 4 \
+  --pin-memory \
+  --wandb-mode disabled \
+  2>&1 | tee log_tune_track_gatv2_mu200_lowpt.txt
 """
 
 import argparse
@@ -65,6 +87,7 @@ import os
 import random
 import re
 import shlex
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -75,6 +98,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import optuna
 import optuna.exceptions
 import optuna.storages
@@ -93,6 +117,110 @@ def now_utc_compact() -> str:
 
 _jsonl_lock = threading.Lock()
 _mkdir_lock = threading.RLock()
+
+
+# Child torchrun processes are launched in their own POSIX sessions.  This keeps a
+# Ctrl-C/SIGINT delivered to the tuner process group from being broadcast directly
+# to every concurrent trial.  The tuner remains the single owner of shutdown and
+# forwards one controlled signal to each torchrun process group.
+_TUNER_STOP_EVENT = threading.Event()
+_active_children_lock = threading.Lock()
+_active_children: Dict[int, subprocess.Popen] = {}
+
+
+class _TunerTermination(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(f"tuner received signal {int(signum)}")
+        self.signum = int(signum)
+
+
+def _register_child(proc: subprocess.Popen) -> None:
+    with _active_children_lock:
+        _active_children[int(proc.pid)] = proc
+
+
+def _unregister_child(proc: subprocess.Popen) -> None:
+    with _active_children_lock:
+        _active_children.pop(int(proc.pid), None)
+
+
+def _signal_trial_process(proc: subprocess.Popen, sig: int, *, whole_group: bool = False) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if whole_group and os.name == "posix":
+            # Reserved for final escalation only.  The normal path signals torchrun
+            # itself and lets torchrun forward the signal to trainer ranks; this
+            # avoids asynchronously interrupting each rank's DataLoader workers.
+            os.killpg(int(proc.pid), int(sig))
+        else:
+            proc.send_signal(int(sig))
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.send_signal(int(sig))
+        except Exception:
+            pass
+
+
+def _signal_active_children(sig: int, *, whole_group: bool = False) -> None:
+    with _active_children_lock:
+        children = list(_active_children.values())
+    for proc in children:
+        _signal_trial_process(proc, sig, whole_group=whole_group)
+
+
+def _shutdown_active_children() -> None:
+    """Best-effort reap of all trial launchers during tuner shutdown."""
+    with _active_children_lock:
+        children = list(_active_children.values())
+    if not children:
+        return
+
+    for proc in children:
+        _signal_trial_process(proc, signal.SIGINT)
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and any(proc.poll() is None for proc in children):
+        time.sleep(0.10)
+
+    for proc in children:
+        if proc.poll() is None:
+            _signal_trial_process(proc, signal.SIGTERM)
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and any(proc.poll() is None for proc in children):
+        time.sleep(0.10)
+
+    for proc in children:
+        if proc.poll() is None:
+            _signal_trial_process(proc, signal.SIGKILL, whole_group=True)
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        _unregister_child(proc)
+
+
+def _tuner_signal_handler(signum, _frame) -> None:
+    # Python executes signal handlers on the main thread.  Mark shutdown first so
+    # Optuna worker threads stop waiting and terminate their isolated torchrun group.
+    _TUNER_STOP_EVENT.set()
+    _signal_active_children(signal.SIGINT)
+    if int(signum) == int(signal.SIGINT):
+        raise KeyboardInterrupt
+    raise _TunerTermination(int(signum))
+
+
+def _install_tuner_signal_handlers() -> None:
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _tuner_signal_handler)
+        except Exception:
+            pass
 
 _TRANSIENT_MKDIR_ERRNOS = {
     errno.ENOENT,
@@ -233,6 +361,15 @@ def load_jsonl_records(path: Path) -> List[Dict[str, Any]]:
 
 
 
+_TRAIN_SIGNAL_FAILURE_PATTERNS: List[str] = [
+    "received 2 death signal",
+    "received 15 death signal",
+    "got signal: 2",
+    "got signal: 15",
+    "signalexception",
+]
+
+
 _TRAIN_IO_FAILURE_PATTERNS: List[Tuple[str, List[str]]] = [
     (
         "hdf5_eos_read",
@@ -303,9 +440,20 @@ def classify_training_failure(
         if matched_type is not None:
             break
 
+    interrupted_by_signal = any(pat in tail_l for pat in _TRAIN_SIGNAL_FAILURE_PATTERNS)
+    if interrupted_by_signal:
+        # Signal traces take precedence over generic text such as "No such file or
+        # directory" that can be emitted secondarily by pin-memory/resource-sharer
+        # teardown after workers have already been interrupted.
+        matched_type = "external_signal"
+        matched_patterns = [pat for pat in _TRAIN_SIGNAL_FAILURE_PATTERNS if pat in tail_l]
+
     likely_eos_io = matched_type in {"hdf5_eos_read", "filesystem_transient"}
     if returncode not in (None, 0):
-        status = "infra_fail" if likely_eos_io else "train_fail"
+        if interrupted_by_signal:
+            status = "interrupted"
+        else:
+            status = "infra_fail" if likely_eos_io else "train_fail"
     else:
         status = "objective_missing"
 
@@ -318,6 +466,7 @@ def classify_training_failure(
             or "traceback" in low
             or "h5py" in low
             or any(p in low for _, pats in _TRAIN_IO_FAILURE_PATTERNS for p in pats)
+            or any(p in low for p in _TRAIN_SIGNAL_FAILURE_PATTERNS)
         ):
             summary_lines.append(line.strip())
     summary = "\n".join(summary_lines[-20:])
@@ -326,6 +475,7 @@ def classify_training_failure(
         "status": status,
         "failure_type": matched_type or ("nonzero_returncode" if returncode not in (None, 0) else "missing_objective"),
         "likely_eos_io": bool(likely_eos_io),
+        "interrupted_by_signal": bool(interrupted_by_signal),
         "matched_patterns": matched_patterns,
         "summary": summary[-4000:],
     }
@@ -378,12 +528,50 @@ def validate_training_inputs(*, data_glob: str, split_file: Path) -> None:
     if not split_file.exists():
         raise RuntimeError(f"[input] split file does not exist: {split_file}")
 
-    matches = glob.glob(data_glob)
+    matches = sorted(glob.glob(data_glob))
     if not matches:
         raise RuntimeError(
             f"[input] data_glob matched 0 files: {data_glob}\n"
             "        Tip: pass an absolute path, or run from the repo root.\n"
             "        Tip: if files are on a remote FS, ensure the mount is visible on this node."
+        )
+
+    # Fail once in the tuner instead of launching many doomed torchrun trials.
+    # A copied dataset is allowed when its ordered filenames match; the trainer
+    # performs the stronger graph-count validation before constructing subsets.
+    with np.load(split_file, allow_pickle=True) as split:
+        if "h5_paths" not in split.files:
+            return
+
+        saved_paths = [str(path) for path in split["h5_paths"].tolist()]
+        current_paths = [str(Path(path).resolve()) for path in matches]
+        if saved_paths == current_paths:
+            return
+
+        saved_names = (
+            [str(name) for name in split["h5_file_names"].tolist()]
+            if "h5_file_names" in split.files
+            else [Path(path).name for path in saved_paths]
+        )
+        current_names = [Path(path).name for path in current_paths]
+
+        if len(set(saved_names)) != len(saved_names) or len(set(current_names)) != len(current_names):
+            raise RuntimeError(
+                "[input] split/data paths differ and duplicate H5 basenames make relocation "
+                "matching ambiguous. Regenerate the split at the current data location."
+            )
+        if saved_names != current_names:
+            raise RuntimeError(
+                "[input] split file is for different H5 files or ordering.\n"
+                f"        split files:   {saved_names}\n"
+                f"        current files: {current_names}\n"
+                "        Regenerate the split for the current --data-glob."
+            )
+
+        print(
+            "[input] split references a different mount path, but ordered H5 filenames match; "
+            "the trainer will verify graph counts before training.",
+            flush=True,
         )
 
 
@@ -691,28 +879,56 @@ def infer_nproc_per_node(requested: int, env: Optional[dict] = None) -> int:
 # -----------------------------
 
 # Example line emitted by train_TrackGraph.py:
-# [epoch 001] train ... smape=(..%,..%,..%) ... | val loss=... ... smape=(ptq%,eta%,phi%) ... rmse_mean=...
+# [epoch 001] train ... | val loss=... pt_mape=..% pt_low_mape=..% low_pt_n=N
+# eta_mae=.. eta_rmse=.. phi_smape=..% rmse_mean=..
 VAL_LINE_RE = re.compile(
     r"\[epoch\s+(?P<epoch>\d+)\].*?"
     r"\|\s*val\s+loss=(?P<val_loss>[-+0-9.eE]+).*?"
-    r"smape=\(\s*(?P<ptq>[-+0-9.eE]+)%\s*,\s*(?P<eta>[-+0-9.eE]+)%\s*,\s*(?P<phi>[-+0-9.eE]+)%\s*\).*?"
+    r"pt_mape=(?P<pt_mape>[-+0-9.eE]+)%\s+"
+    r"pt_low_mape=(?P<pt_low_mape>[-+0-9.eE]+)%\s+"
+    r"low_pt_n=(?P<low_pt_n>\d+)\s+"
+    r"eta_mae=(?P<eta_mae>[-+0-9.eE]+)\s+"
+    r"eta_rmse=(?P<eta_rmse>[-+0-9.eE]+)\s+"
+    r"phi_smape=(?P<phi_smape>[-+0-9.eE]+)%\s+"
     r"rmse_mean=(?P<rmse_mean>[-+0-9.eE]+)",
     re.IGNORECASE,
 )
 
 
-def parse_log_regression_metrics(log_path: Path, *, weights: Tuple[float, float, float]) -> Dict[str, Any]:
-    """
-    Parse all validation epochs from train_TrackGraph.py log and return:
-      - best_overall_smape: min weighted mean of val/smape_{ptq,eta,phi}
-      - best epoch and per-component values
-      - last epoch values
+def _objective_from_record(rec: Dict[str, Any], args) -> float:
+    metric = str(args.objective_metric)
+    if metric == "pt_low_mape":
+        return float(rec["val_pt_low_mape"])
+    if metric == "balanced":
+        # Dimensionless normalized score.  The three components intentionally use
+        # different comparison metrics: low-pt MAPE, eta MAE, phi SMAPE.
+        weights = parse_three_floats_csv(args.objective_component_weights, default=(4.0, 1.0, 1.0))
+        scales = parse_three_floats_csv(args.objective_component_scales, default=(10.0, 0.05, 10.0))
+        if any(x <= 0.0 for x in scales):
+            raise ValueError("--objective-component-scales must all be > 0")
+        values = (
+            float(rec["val_pt_low_mape"]) / scales[0],
+            float(rec["val_eta_mae"]) / scales[1],
+            float(rec["val_phi_smape"]) / scales[2],
+        )
+        return weighted_mean3(values, weights)
+    raise ValueError(f"Unsupported objective_metric={metric}")
+
+
+def parse_log_regression_metrics(log_path: Path, *, args) -> Dict[str, Any]:
+    """Parse validation metrics and select the best epoch for the requested objective.
+
+    Primary comparison metrics are:
+      pt-like -> low-pt MAPE (truth |pt| < threshold),
+      eta     -> MAE,
+      phi     -> SMAPE.
     """
     out: Dict[str, Any] = {
         "log_path": str(log_path),
         "log_exists": Path(log_path).exists(),
-        "objective_name": "val_smape_mean",
-        "objective_weights": list(weights),
+        "objective_name": str(args.objective_metric),
+        "objective_weights": str(args.objective_component_weights),
+        "objective_scales": str(args.objective_component_scales),
         "epochs_seen": 0,
     }
     if not Path(log_path).exists():
@@ -727,21 +943,20 @@ def parse_log_regression_metrics(log_path: Path, *, weights: Tuple[float, float,
                 m = VAL_LINE_RE.search(line)
                 if not m:
                     continue
-                ptq = float(m.group("ptq"))
-                eta = float(m.group("eta"))
-                phi = float(m.group("phi"))
-                overall = weighted_mean3((ptq, eta, phi), weights)
                 rec: Dict[str, Any] = {
                     "epoch": int(m.group("epoch")),
                     "val_loss": float(m.group("val_loss")),
-                    "val_smape_ptq": ptq,
-                    "val_smape_eta": eta,
-                    "val_smape_phi": phi,
-                    "val_smape_mean": overall,
+                    "val_pt_mape": float(m.group("pt_mape")),
+                    "val_pt_low_mape": float(m.group("pt_low_mape")),
+                    "val_low_pt_n": int(m.group("low_pt_n")),
+                    "val_eta_mae": float(m.group("eta_mae")),
+                    "val_eta_rmse": float(m.group("eta_rmse")),
+                    "val_phi_smape": float(m.group("phi_smape")),
                     "val_rmse_mean": float(m.group("rmse_mean")),
                 }
+                rec["objective_value"] = _objective_from_record(rec, args)
                 last = rec
-                if best is None or overall < float(best["val_smape_mean"]):
+                if best is None or float(rec["objective_value"]) < float(best["objective_value"]):
                     best = dict(rec)
     except Exception as e:
         out["parse_error"] = f"{type(e).__name__}: {e}"
@@ -752,22 +967,19 @@ def parse_log_regression_metrics(log_path: Path, *, weights: Tuple[float, float,
         out["last"] = last
     if best is not None:
         out["best"] = best
-        out["best_overall_smape"] = safe_float(best.get("val_smape_mean"))
+        out["best_objective"] = safe_float(best.get("objective_value"))
         out["best_epoch"] = best.get("epoch")
-        out["val_smape_ptq"] = best.get("val_smape_ptq")
-        out["val_smape_eta"] = best.get("val_smape_eta")
-        out["val_smape_phi"] = best.get("val_smape_phi")
-        out["val_loss_at_best_smape"] = best.get("val_loss")
-        out["val_rmse_mean_at_best_smape"] = best.get("val_rmse_mean")
+        for k in (
+            "val_pt_mape", "val_pt_low_mape", "val_low_pt_n",
+            "val_eta_mae", "val_eta_rmse", "val_phi_smape",
+            "val_loss", "val_rmse_mean",
+        ):
+            out[k] = best.get(k)
     return out
 
 
 def read_ckpt_metrics(ckpt_path: Path) -> Dict[str, Any]:
-    """
-    Read lightweight metadata from the trainer checkpoint. SMAPE itself is taken
-    from the log because train_TrackGraph.py currently does not persist SMAPE in
-    the checkpoint.
-    """
+    """Read lightweight metadata from the trainer checkpoint."""
     out: Dict[str, Any] = {"ckpt_path": str(ckpt_path)}
     if not Path(ckpt_path).exists():
         out["ckpt_exists"] = False
@@ -783,9 +995,13 @@ def read_ckpt_metrics(ckpt_path: Path) -> Dict[str, Any]:
     for k in [
         "best_monitor", "early_stop_monitor", "best_ckpt_epoch", "run_id",
         "hidden_dim", "layers", "dropout", "layer_type", "gat_heads",
-        "sage_aggr", "edgeconv_aggr", "graph_pool", "loss_type",
+        "sage_aggr", "edgeconv_aggr", "graph_pool", "batch_size", "loss_type",
         "fourier", "fourier_base", "fourier_min_exp", "fourier_max_exp",
         "target_scale_mode", "target_scale_eps", "phi_mode", "phi_period",
+        "pt_transform", "pt_asinh_scale", "low_pt_threshold", "low_pt_loss_weight",
+        "low_pt_relative_loss_weight", "pt_relative_floor", "pt_mape_floor",
+        "val_pt_mape", "val_pt_low_mape", "val_low_pt_n", "val_eta_mae",
+        "val_eta_rmse", "val_phi_smape",
         "weight_decay", "edge_dropout", "feat_noise_std", "ema", "ema_decay",
         "lr_schedule", "warmup_epochs", "min_lr_ratio", "code_version", "epoch",
         "bad_epochs",
@@ -820,7 +1036,12 @@ def read_ckpt_metrics(ckpt_path: Path) -> Dict[str, Any]:
 
 
 def objective_display_name(args) -> str:
-    return f"val_smape_mean[{args.objective_component_weights}]"
+    if args.objective_metric == "pt_low_mape":
+        return f"val_pt_low_mape[|pt|<{args.low_pt_threshold:g}]"
+    return (
+        f"balanced[lowpt_mape,eta_mae,phi_smape; "
+        f"w={args.objective_component_weights}; scales={args.objective_component_scales}]"
+    )
 
 
 def objective_direction(_args) -> str:
@@ -828,9 +1049,8 @@ def objective_direction(_args) -> str:
 
 
 def objective_value_from_log(log_path: Path, args) -> Tuple[Optional[float], Dict[str, Any]]:
-    weights = parse_three_floats_csv(args.objective_component_weights)
-    log_metrics = parse_log_regression_metrics(log_path, weights=weights)
-    return safe_float(log_metrics.get("best_overall_smape")), log_metrics
+    log_metrics = parse_log_regression_metrics(log_path, args=args)
+    return safe_float(log_metrics.get("best_objective")), log_metrics
 
 
 # -----------------------------
@@ -842,6 +1062,11 @@ def normalize_hparams(hp: Dict[str, Any]) -> Dict[str, Any]:
     layer_type = hp.get("layer_type", "mpnn")
     hp.setdefault("layer_type", layer_type)
     hp.setdefault("gat_heads", 4)
+    # Old trial records may predate the attention-mode fields.  For a GAT study,
+    # default such records to the recommended GATv2 edge-aware architecture;
+    # non-GAT families are forced off below.
+    hp.setdefault("gat_edge_attn", False)
+    hp.setdefault("gatv2_edge_attn", layer_type == "gat_residual")
     hp.setdefault("sage_aggr", "mean")
     hp.setdefault("edgeconv_aggr", "mean")
     hp.setdefault("graph_pool", "meanmax")
@@ -851,6 +1076,10 @@ def normalize_hparams(hp: Dict[str, Any]) -> Dict[str, Any]:
     hp.setdefault("fourier_max_exp", 6)
     hp.setdefault("loss_type", "smoothl1")
     hp.setdefault("target_scale", "robust")
+    hp.setdefault("pt_transform", "asinh")
+    hp.setdefault("pt_asinh_scale", 10.0)
+    hp.setdefault("low_pt_loss_weight", 2.0)
+    hp.setdefault("low_pt_relative_loss_weight", 0.25)
     hp.setdefault("phi_mode", "sincos")
     hp.setdefault("phi_vec_weight", 1.0)
     hp.setdefault("target_loss_weights", "1.0,1.0,1.0")
@@ -862,8 +1091,14 @@ def normalize_hparams(hp: Dict[str, Any]) -> Dict[str, Any]:
             valid_heads = [1]
         if int(hp.get("gat_heads", 4)) not in valid_heads:
             hp["gat_heads"] = 4 if 4 in valid_heads else valid_heads[0]
+        hp["gat_edge_attn"] = bool(hp.get("gat_edge_attn", False))
+        hp["gatv2_edge_attn"] = bool(hp.get("gatv2_edge_attn", True))
+        if hp["gat_edge_attn"] and hp["gatv2_edge_attn"]:
+            raise ValueError("gat_edge_attn and gatv2_edge_attn are mutually exclusive")
     else:
         hp["gat_heads"] = int(hp.get("gat_heads", 4))
+        hp["gat_edge_attn"] = False
+        hp["gatv2_edge_attn"] = False
 
     return hp
 
@@ -888,6 +1123,23 @@ def sample_hparams(trial: optuna.Trial, args) -> Dict[str, Any]:
 
     hp["loss_type"] = trial.suggest_categorical("loss_type", args.loss_type_choices)
     hp["target_scale"] = trial.suggest_categorical("target_scale", args.target_scale_choices)
+    hp["pt_transform"] = trial.suggest_categorical("pt_transform", args.pt_transform_choices)
+    if hp["pt_transform"] == "asinh":
+        hp["pt_asinh_scale"] = trial.suggest_categorical("pt_asinh_scale", args.pt_asinh_scale_choices)
+    else:
+        hp["pt_asinh_scale"] = float(args.fixed_pt_asinh_scale)
+
+    if args.tune_low_pt_loss:
+        hp["low_pt_loss_weight"] = trial.suggest_float(
+            "low_pt_loss_weight", args.low_pt_loss_weight_low, args.low_pt_loss_weight_high
+        )
+        hp["low_pt_relative_loss_weight"] = trial.suggest_categorical(
+            "low_pt_relative_loss_weight", args.low_pt_relative_loss_weight_choices
+        )
+    else:
+        hp["low_pt_loss_weight"] = float(args.fixed_low_pt_loss_weight)
+        hp["low_pt_relative_loss_weight"] = float(args.fixed_low_pt_relative_loss_weight)
+
     hp["graph_pool"] = trial.suggest_categorical("graph_pool", args.graph_pool_choices)
 
     if args.fixed_phi_mode is not None:
@@ -920,8 +1172,12 @@ def sample_hparams(trial: optuna.Trial, args) -> Dict[str, Any]:
         if not valid_heads:
             raise optuna.TrialPruned()
         hp["gat_heads"] = trial.suggest_categorical("gat_heads", valid_heads)
+        hp["gat_edge_attn"] = bool(args.gat_edge_attn)
+        hp["gatv2_edge_attn"] = bool(args.gatv2_edge_attn)
     else:
         hp["gat_heads"] = 4
+        hp["gat_edge_attn"] = False
+        hp["gatv2_edge_attn"] = False
 
     if hp["layer_type"] == "sage_residual":
         hp["sage_aggr"] = trial.suggest_categorical("sage_aggr", ["mean", "sum", "max"])
@@ -983,6 +1239,7 @@ def build_command(
         "--data-glob", args.data_glob,
         "--split-file", args.split_file,
         "--epochs", str(int(epochs)),
+        "--batch-size", str(int(args.batch_size)),
         "--num-workers", str(int(args.num_workers)),
         "--save", args.save,
         "--save-dir", str(save_dir_abs),
@@ -1066,6 +1323,13 @@ def build_command(
     cmd += ["--loss-type", str(hp["loss_type"])]
     cmd += ["--target-scale", str(hp["target_scale"])]
     cmd += ["--target-scale-eps", f"{float(args.target_scale_eps):.8g}"]
+    cmd += ["--pt-transform", str(hp["pt_transform"])]
+    cmd += ["--pt-asinh-scale", f"{float(hp['pt_asinh_scale']):.8g}"]
+    cmd += ["--low-pt-threshold", f"{float(args.low_pt_threshold):.8g}"]
+    cmd += ["--low-pt-loss-weight", f"{float(hp['low_pt_loss_weight']):.8g}"]
+    cmd += ["--low-pt-relative-loss-weight", f"{float(hp['low_pt_relative_loss_weight']):.8g}"]
+    cmd += ["--pt-relative-floor", f"{float(args.pt_relative_floor):.8g}"]
+    cmd += ["--pt-mape-floor", f"{float(args.pt_mape_floor):.8g}"]
     cmd += ["--target-loss-weights", str(hp["target_loss_weights"])]
     cmd += ["--phi-mode", str(hp["phi_mode"])]
     cmd += ["--phi-period", f"{float(args.phi_period):.12g}"]
@@ -1075,6 +1339,8 @@ def build_command(
     # Layer family knobs
     cmd += ["--layer-type", str(hp["layer_type"])]
     cmd += ["--gat-heads", str(int(hp.get("gat_heads", 4)))]
+    cmd += ["--gat-edge-attn" if bool(hp.get("gat_edge_attn", False)) else "--no-gat-edge-attn"]
+    cmd += ["--gatv2-edge-attn" if bool(hp.get("gatv2_edge_attn", False)) else "--no-gatv2-edge-attn"]
     cmd += ["--sage-aggr", str(hp.get("sage_aggr", "mean"))]
     cmd += ["--edgeconv-aggr", str(hp.get("edgeconv_aggr", "mean"))]
 
@@ -1091,22 +1357,53 @@ def build_command(
 
 
 def run_trial(cmd: List[str], log_path: Path, env: dict, *, save_dir: Optional[Path] = None) -> int:
+    """Run one torchrun trial in an isolated process group with controlled shutdown."""
     mkdir(log_path.parent)
-    shell_cmd = " ".join(shlex.quote(x) for x in cmd)
     if save_dir is not None:
-        save_dir = Path(save_dir).expanduser().resolve()
-        shell_cmd = f"mkdir -p {shlex.quote(str(save_dir))} && exec {shell_cmd}"
+        mkdir(Path(save_dir).expanduser().resolve())
 
+    display_cmd = " ".join(shlex.quote(x) for x in cmd)
     with log_path.open("w", encoding="utf-8") as lf:
-        lf.write("COMMAND:\n" + shell_cmd + "\n\n")
+        lf.write("COMMAND:\n" + display_cmd + "\n\n")
         lf.flush()
-        p = subprocess.run(
-            ["bash", "-lc", shell_cmd],
+
+        proc = subprocess.Popen(
+            cmd,
             stdout=lf,
             stderr=subprocess.STDOUT,
             env=env,
+            start_new_session=(os.name == "posix"),
         )
-    return int(p.returncode)
+        _register_child(proc)
+        shutdown_t0: Optional[float] = None
+        sent_term = False
+        sent_kill = False
+        try:
+            while True:
+                try:
+                    return int(proc.wait(timeout=0.25))
+                except subprocess.TimeoutExpired:
+                    pass
+
+                if not _TUNER_STOP_EVENT.is_set():
+                    continue
+
+                now = time.monotonic()
+                if shutdown_t0 is None:
+                    shutdown_t0 = now
+                    _signal_trial_process(proc, signal.SIGINT)
+                    continue
+
+                elapsed = now - shutdown_t0
+                if elapsed >= 10.0 and not sent_term:
+                    _signal_trial_process(proc, signal.SIGTERM)
+                    sent_term = True
+                if elapsed >= 20.0 and not sent_kill and proc.poll() is None:
+                    _signal_trial_process(proc, signal.SIGKILL, whole_group=True)
+                    sent_kill = True
+        finally:
+            if proc.poll() is not None:
+                _unregister_child(proc)
 
 
 
@@ -1183,7 +1480,7 @@ def print_fast_phase_best_from_trials(trials: List[Any], args) -> None:
     user_attrs = getattr(best, "user_attrs", {}) or {}
     best_attrs = {
         k: user_attrs.get(k)
-        for k in ["epoch", "val_smape_ptq", "val_smape_eta", "val_smape_phi", "val_smape_mean", "val_loss", "val_rmse_mean"]
+        for k in ["epoch", "val_pt_low_mape", "val_pt_mape", "val_eta_mae", "val_eta_rmse", "val_phi_smape", "val_low_pt_n", "val_loss", "val_rmse_mean"]
         if k in user_attrs
     }
     if best_attrs:
@@ -1269,7 +1566,7 @@ def objective_factory(
                         progress_db_update_done(
                             progress_db_path, progress_row_id,
                             status="pruned", returncode=None, seconds=0.0, best_objective=None,
-                            error="resume_skip_existing: checkpoint/log exist but SMAPE objective was not parseable",
+                            error="resume_skip_existing: checkpoint/log exist but requested objective was not parseable",
                             timeout_s=int(args.progress_db_timeout),
                         )
                     raise optuna.TrialPruned()
@@ -1313,7 +1610,7 @@ def objective_factory(
                 "phase": "fast",
                 "gpus": gpu_ids,
                 "master_port": int(master_port),
-                "objective_metric": "val_smape_mean",
+                "objective_metric": str(args.objective_metric),
                 "objective_display_name": objective_display_name(args),
                 "objective_direction": objective_direction(args),
                 "objective_value": objective_value,
@@ -1336,13 +1633,16 @@ def objective_factory(
                 if progress_db_path is not None and progress_row_id is not None:
                     progress_db_update_done(
                         progress_db_path, progress_row_id,
-                        status="fail" if rc != 0 else "pruned",
+                        status=(
+                            "interrupted" if failure_info.get("status") == "interrupted"
+                            else ("fail" if rc != 0 else "pruned")
+                        ),
                         returncode=int(rc),
                         seconds=float(dt),
                         best_objective=None,
                         error=(
                             f"{failure_info.get('failure_type')}: nonzero returncode {rc}" if rc != 0
-                            else "SMAPE objective missing or log parse failed"
+                            else "requested objective missing or log parse failed"
                         ),
                         timeout_s=int(args.progress_db_timeout),
                     )
@@ -1361,7 +1661,7 @@ def objective_factory(
             trial.set_user_attr("run_id", run_id)
             trial.set_user_attr("gpus", ",".join(gpu_ids))
             trial.set_user_attr("master_port", int(master_port))
-            trial.set_user_attr("objective_metric", "val_smape_mean")
+            trial.set_user_attr("objective_metric", str(args.objective_metric))
             trial.set_user_attr("objective_display_name", objective_display_name(args))
             trial.set_user_attr("objective_value", float(objective_value))
             trial.set_user_attr("hparams", hparams_clean)
@@ -1533,7 +1833,7 @@ def refit_topk(
                 "phase": "refit",
                 "gpus": gpu_ids,
                 "master_port": int(master_port),
-                "objective_metric": "val_smape_mean",
+                "objective_metric": str(args.objective_metric),
                 "objective_display_name": objective_display_name(args),
                 "objective_direction": objective_direction(args),
                 "objective_value": refit_objective_value,
@@ -1561,15 +1861,15 @@ def refit_topk(
                     returncode=int(rc),
                     seconds=float(dt),
                     best_objective=safe_float(refit_objective_value),
-                    error=None if status == "ok" else f"{failure_info.get('failure_type')}: refit failed rc={rc} or missing SMAPE objective",
+                    error=None if status == "ok" else f"{failure_info.get('failure_type')}: refit failed rc={rc} or missing requested objective",
                     timeout_s=int(args.progress_db_timeout),
                 )
 
             best = log_metrics.get("best", {}) if isinstance(log_metrics, dict) else {}
             print(
-                f"[refit top{rank:02d}] rc={rc} "
-                f"val_smape_mean={refit_objective_value} "
-                f"ptq={best.get('val_smape_ptq')} eta={best.get('val_smape_eta')} phi={best.get('val_smape_phi')} "
+                f"[refit top{rank:02d}] rc={rc} objective={refit_objective_value} "
+                f"pt_low_mape={best.get('val_pt_low_mape')}% pt_mape={best.get('val_pt_mape')}% "
+                f"eta_mae={best.get('val_eta_mae')} phi_smape={best.get('val_phi_smape')}% "
                 f"ckpt={ckpt_path.name}",
                 flush=True,
             )
@@ -1651,12 +1951,15 @@ def enqueue_retry_trials(
 
 
 def main() -> None:
+    _TUNER_STOP_EVENT.clear()
+    _install_tuner_signal_handlers()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-script", type=Path, required=True)
     ap.add_argument("--data-glob", required=True)
     ap.add_argument("--split-file", required=True)
 
-    ap.add_argument("--out-dir", type=Path, default=Path("./tuning_track_graph_smape"))
+    ap.add_argument("--out-dir", type=Path, default=Path("./tuning_track_graph_lowpt"))
     ap.add_argument("--save", default="track_graph_regressor_v2.pt")
 
     ap.add_argument("--n-trials", type=int, default=100)
@@ -1679,8 +1982,29 @@ def main() -> None:
         choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"],
         help="If set, restrict this Optuna study to one layer_type.",
     )
+    ap.add_argument(
+        "--gat-edge-attn",
+        action="store_true",
+        default=False,
+        help=(
+            "For GAT trials, use the baseline GAT scorer plus an edge_attr bias encoder. "
+            "Use --no-gatv2-edge-attn at the same time."
+        ),
+    )
+    ap.add_argument("--no-gat-edge-attn", dest="gat_edge_attn", action="store_false")
+    ap.add_argument(
+        "--gatv2-edge-attn",
+        action="store_true",
+        default=True,
+        help=(
+            "For GAT trials, use the DisplacedVertex-style nonlinear source-destination-edge "
+            "GATv2 attention and edge-conditioned messages (recommended/default)."
+        ),
+    )
+    ap.add_argument("--no-gatv2-edge-attn", dest="gatv2_edge_attn", action="store_false")
 
     # Dataloader/trainer controls
+    ap.add_argument("--batch-size", type=int, default=16, help="Graphs per GPU per optimizer step; forwarded unchanged to the trainer.")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--pin-memory", action="store_true")
     ap.add_argument("--prefetch-factor", type=int, default=1, help="Lower values reduce /dev/shm pressure under many DDP jobs.")
@@ -1720,12 +2044,19 @@ def main() -> None:
     ap.add_argument("--no-resume-skip-existing-refit", dest="resume_skip_existing_refit", action="store_false")
 
     # Objective
-    ap.add_argument("--objective-component-weights", default="1.0,1.0,1.0",
-                    help="Weights for overall SMAPE objective as ptq,eta,phi. Default = unweighted mean.")
+    ap.add_argument("--objective-metric", default="pt_low_mape", choices=["pt_low_mape", "balanced"],
+                    help="Default ranks trials directly by validation MAPE in the low-pt regime.")
+    ap.add_argument("--objective-component-weights", default="4.0,1.0,1.0",
+                    help="Balanced-objective weights for low-pt MAPE, eta MAE, phi SMAPE.")
+    ap.add_argument("--objective-component-scales", default="10.0,0.05,10.0",
+                    help="Reference scales for balanced objective: low-pt MAPE[%%], eta MAE, phi SMAPE[%%].")
 
-    # Trainer early stop still uses trainer-supported monitor.
-    ap.add_argument("--early-stop-monitor", default="val_loss", choices=["val_loss", "val_rmse_mean"],
-                    help="Trainer checkpoint/early-stop monitor. Optuna objective remains log-parsed mean SMAPE.")
+    # Match checkpoint selection to the physics quantity used by the tuner by default.
+    ap.add_argument(
+        "--early-stop-monitor", default="val_pt_low_mape",
+        choices=["val_loss", "val_rmse_mean", "val_pt_mape", "val_pt_low_mape", "val_eta_mae", "val_phi_smape"],
+        help="Trainer checkpoint/early-stop monitor. Default matches the low-pt tuning objective.",
+    )
     ap.add_argument("--early-stop-min-delta", type=float, default=0.0)
     ap.add_argument("--no-early-stop", action="store_true", default=False)
     ap.add_argument("--reload-best-half-patience", action="store_true", default=False)
@@ -1760,6 +2091,20 @@ def main() -> None:
     ap.add_argument("--target-scale-choices", type=_csv_strings, default=["robust", "standard", "none"])
     ap.add_argument("--target-scale-eps", type=float, default=1e-6)
     ap.add_argument("--target-stats-max-events", type=int, default=-1)
+    ap.add_argument("--pt-transform-choices", type=_csv_strings, default=["asinh", "linear"],
+                    help="Tune signed pt target parameterization; asinh is recommended for a wide dynamic range.")
+    ap.add_argument("--pt-asinh-scale-choices", type=_csv_floats, default=[5.0, 10.0, 20.0, 40.0])
+    ap.add_argument("--fixed-pt-asinh-scale", type=float, default=10.0)
+    ap.add_argument("--low-pt-threshold", type=float, default=100.0)
+    ap.add_argument("--pt-relative-floor", type=float, default=5.0)
+    ap.add_argument("--pt-mape-floor", type=float, default=1.0)
+    ap.add_argument("--tune-low-pt-loss", action="store_true", default=True)
+    ap.add_argument("--no-tune-low-pt-loss", dest="tune_low_pt_loss", action="store_false")
+    ap.add_argument("--low-pt-loss-weight-low", type=float, default=1.0)
+    ap.add_argument("--low-pt-loss-weight-high", type=float, default=4.0)
+    ap.add_argument("--low-pt-relative-loss-weight-choices", type=_csv_floats, default=[0.0, 0.1, 0.25, 0.5])
+    ap.add_argument("--fixed-low-pt-loss-weight", type=float, default=2.0)
+    ap.add_argument("--fixed-low-pt-relative-loss-weight", type=float, default=0.25)
     ap.add_argument("--graph-pool-choices", type=_csv_strings, default=["meanmax", "mean", "max"])
 
     ap.add_argument("--fixed-phi-mode", default=None, choices=["sincos", "scalar"])
@@ -1792,7 +2137,7 @@ def main() -> None:
     ap.add_argument("--wandb-mode", default="disabled", choices=["online", "offline", "disabled"])
     ap.add_argument("--wandb-project", default="track_graph_regressor_tuning")
 
-    ap.add_argument("--study-name", default="track_graph_mean_smape")
+    ap.add_argument("--study-name", default="track_graph_lowpt_mape")
     ap.add_argument("--code-version", default=None)
 
     ap.add_argument("--refit-only", action="store_true", default=False,
@@ -1822,6 +2167,16 @@ def main() -> None:
     ap.add_argument("--stop-on-trial-error", dest="continue_on_trial_error", action="store_false")
 
     args = ap.parse_args()
+
+    if args.gat_edge_attn and args.gatv2_edge_attn:
+        raise SystemExit(
+            "--gat-edge-attn and --gatv2-edge-attn are mutually exclusive. "
+            "For the DisplacedVertex-style GAT use the default --gatv2-edge-attn; "
+            "for edge-bias baseline GAT add --gat-edge-attn --no-gatv2-edge-attn."
+        )
+
+    if int(args.batch_size) < 1:
+        raise SystemExit(f"--batch-size must be >= 1, got {args.batch_size}")
 
     args.jsonl_session_id_user_supplied = args.jsonl_session_id is not None
     args.jsonl_session_id = str(args.jsonl_session_id or now_utc_compact())
@@ -1968,13 +2323,13 @@ def main() -> None:
         print(f"[retry] Enqueued {n_requeued} previous failed/pruned trial configs for retry.", flush=True)
 
     print(
-        f"[objective] metric=val_smape_mean display={objective_display_name(args)} "
+        f"[objective] metric={args.objective_metric} display={objective_display_name(args)} "
         f"direction={objective_direction(args)}",
         flush=True,
     )
     print(
-        f"[objective] tuner will parse validation SMAPE from trainer logs; "
-        f"trainer checkpoint monitor remains --early-stop-monitor={args.early_stop_monitor}",
+        f"[objective] comparison metrics: low-pt MAPE (|pt|<{args.low_pt_threshold:g}), "
+        f"eta MAE, phi SMAPE; trainer checkpoint monitor={args.early_stop_monitor}",
         flush=True,
     )
 
@@ -2030,4 +2385,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _exit_code = 0
+    try:
+        main()
+    except KeyboardInterrupt:
+        _exit_code = 128 + int(signal.SIGINT)
+        print("\n[tuner] Interrupted by SIGINT; stopping active torchrun trials cleanly.", flush=True)
+    except _TunerTermination as e:
+        _exit_code = 128 + int(e.signum)
+        print(f"\n[tuner] Received signal {e.signum}; stopping active torchrun trials cleanly.", flush=True)
+    finally:
+        _TUNER_STOP_EVENT.set()
+        _shutdown_active_children()
+
+    if _exit_code:
+        raise SystemExit(_exit_code)
