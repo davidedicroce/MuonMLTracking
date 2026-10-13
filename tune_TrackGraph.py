@@ -1283,6 +1283,11 @@ def build_command(
         cmd.append("--no-amp")
     cmd += ["--amp-dtype", str(args.amp_dtype)]
 
+    if args.cuda_sync_debug:
+        cmd.append("--cuda-sync-debug")
+    if args.epoch_memory_cleanup:
+        cmd.append("--epoch-memory-cleanup")
+
     if max_train_graphs > 0:
         cmd += ["--max-train-graphs", str(int(max_train_graphs))]
 
@@ -2023,6 +2028,18 @@ def main() -> None:
     ap.add_argument("--trainer-amp", dest="trainer_amp", action="store_true", default=True)
     ap.add_argument("--no-trainer-amp", dest="trainer_amp", action="store_false")
     ap.add_argument("--amp-dtype", default="bf16", choices=["bf16", "fp16"])
+    ap.add_argument(
+        "--cuda-sync-debug",
+        action="store_true",
+        default=False,
+        help="Forward trainer CUDA synchronization debug mode. Leave off for normal tuning throughput.",
+    )
+    ap.add_argument(
+        "--epoch-memory-cleanup",
+        action="store_true",
+        default=False,
+        help="Forward trainer per-phase gc.collect()/torch.cuda.empty_cache() cleanup mode.",
+    )
 
     # Fast proxy phase
     ap.add_argument("--fast-epochs", type=int, default=40)

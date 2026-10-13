@@ -1229,13 +1229,20 @@ class CustomGAT(nn.Module):
         alpha = alpha / alpha_sum[dst].clamp(min=1e-6)
         alpha = self.dropout(alpha)
 
-        out = torch.zeros((num_nodes, self.heads, self.out_channels), device=x.device, dtype=torch.float32)
-        for head_idx in range(self.heads):
-            out[:, head_idx].scatter_add_(
-                0,
-                dst.unsqueeze(-1).expand_as(messages[:, head_idx]),
-                alpha[:, head_idx].unsqueeze(-1) * messages[:, head_idx],
-            )
+        # Accumulate all attention heads in one scatter operation. The previous
+        # Python loop launched one scatter_add kernel per head, which is expensive
+        # for small/medium graphs where kernel-launch overhead is significant.
+        weighted_messages = alpha.unsqueeze(-1) * messages
+        out = torch.zeros(
+            (num_nodes, self.heads, self.out_channels),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        out.scatter_add_(
+            0,
+            dst.view(-1, 1, 1).expand_as(weighted_messages),
+            weighted_messages,
+        )
 
         if self.concat:
             return out.view(num_nodes, self.heads * self.out_channels).to(out_dtype)
@@ -1725,23 +1732,35 @@ def estimate_target_transform(
         return center, scale
 
     if mode == "robust":
-        loader = _make_stats_loader(train_ds, num_workers=0)
-        ys = []
-        for i, batch in enumerate(loader):
-            if max_events > 0 and i >= max_events:
-                break
-            ys.append(get_y2(batch).float().view(1, 2))
+        # Robust quantiles are not reducible from per-rank quantiles. The old DDP
+        # path therefore made every rank scan the entire HDF5 training subset,
+        # duplicating EOS I/O and quantile work. Compute the exact same full-data
+        # quantiles on rank 0 once, then broadcast the two small result tensors.
+        if world == 1 or rank == 0:
+            loader = _make_stats_loader(train_ds, num_workers=0)
+            ys = []
+            for i, batch in enumerate(loader):
+                if max_events > 0 and i >= max_events:
+                    break
+                ys.append(get_y2(batch).float().view(1, 2))
 
-        if len(ys) == 0:
-            center = torch.zeros(2, dtype=torch.float32, device=device)
-            scale = torch.ones(2, dtype=torch.float32, device=device)
+            if len(ys) == 0:
+                center = torch.zeros(2, dtype=torch.float32, device=device)
+                scale = torch.ones(2, dtype=torch.float32, device=device)
+            else:
+                y = torch.cat(ys, dim=0).to(device)
+                q25 = torch.quantile(y, 0.25, dim=0)
+                q50 = torch.quantile(y, 0.50, dim=0)
+                q75 = torch.quantile(y, 0.75, dim=0)
+                center = q50
+                scale = (q75 - q25).clamp(min=eps)
         else:
-            y = torch.cat(ys, dim=0).to(device)
-            q25 = torch.quantile(y, 0.25, dim=0)
-            q50 = torch.quantile(y, 0.50, dim=0)
-            q75 = torch.quantile(y, 0.75, dim=0)
-            center = q50
-            scale = (q75 - q25).clamp(min=eps)
+            center = torch.empty(2, dtype=torch.float32, device=device)
+            scale = torch.empty(2, dtype=torch.float32, device=device)
+
+        if ddp_is_initialized():
+            dist.broadcast(center, src=0)
+            dist.broadcast(scale, src=0)
         return center, scale
 
     raise ValueError(f"Unknown target scaling mode: {mode}")
@@ -2157,6 +2176,24 @@ def main():
 
     ap.add_argument("--time", action="store_true", default=True)
     ap.add_argument("--no-time", dest="time", action="store_false")
+    ap.add_argument(
+        "--cuda-sync-debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Synchronize CUDA after H2D copies and forward passes to localize asynchronous "
+            "CUDA errors. This is useful for debugging but reduces throughput and GPU utilization."
+        ),
+    )
+    ap.add_argument(
+        "--epoch-memory-cleanup",
+        action="store_true",
+        default=False,
+        help=(
+            "Run gc.collect() and torch.cuda.empty_cache() after each train/validation phase. "
+            "Normally leave this off so the CUDA caching allocator can reuse memory."
+        ),
+    )
 
     ap.add_argument("--batch-size", type=int, default=16, help="Number of independent graphs per GPU per optimizer step.")
     ap.add_argument("--num-workers", type=int, default=4)
@@ -2592,7 +2629,7 @@ def main():
                     edge_attr = batch["edge_attr"]
                     batch_index = batch["batch_index"]
                     y = batch["y_track"].float()
-                    if device.type == "cuda":
+                    if args.cuda_sync_debug and device.type == "cuda":
                         torch.cuda.synchronize(device)
                 except Exception as e:
                     if quarantine_bad_batch(batch, e, where="train/load_or_h2d", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
@@ -2638,7 +2675,7 @@ def main():
 
                     if not torch.isfinite(loss):
                         raise RuntimeError(f"Non-finite loss for {batch_id}")
-                    if device.type == "cuda":
+                    if args.cuda_sync_debug and device.type == "cuda":
                         torch.cuda.synchronize(device)
                 except Exception as e:
                     if quarantine_bad_batch(batch, e, where="train/forward", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
@@ -2689,9 +2726,10 @@ def main():
 
                 del x, edge_index, edge_attr, batch_index, y, pred_dict, loss, pieces, pred_metric, metric_parts
 
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        if args.epoch_memory_cleanup:
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         ddp_all_reduce_sum(train_loss)
         ddp_all_reduce_sum(train_steps)
@@ -2738,7 +2776,7 @@ def main():
                         edge_attr = batch["edge_attr"]
                         batch_index = batch["batch_index"]
                         y = batch["y_track"].float()
-                        if device.type == "cuda":
+                        if args.cuda_sync_debug and device.type == "cuda":
                             torch.cuda.synchronize(device)
                     except Exception as e:
                         if quarantine_bad_batch(batch, e, where="val/load_or_h2d", quarantine_file=args.bad_graphs_file, skip_bad_graphs=args.skip_bad_graphs):
@@ -2770,7 +2808,7 @@ def main():
 
                     if not torch.isfinite(loss):
                         raise RuntimeError(f"Non-finite val loss for {_batch_id_string(batch)}")
-                    if device.type == "cuda":
+                    if args.cuda_sync_debug and device.type == "cuda":
                         torch.cuda.synchronize(device)
 
                     pred_metric = decode_prediction_to_metric(
@@ -2799,9 +2837,10 @@ def main():
 
                     del x, edge_index, edge_attr, batch_index, y, pred_dict, loss, pieces, pred_metric, metric_parts
 
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        if args.epoch_memory_cleanup:
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         ddp_all_reduce_sum(val_loss)
         ddp_all_reduce_sum(val_steps)
