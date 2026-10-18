@@ -904,6 +904,223 @@ class SAGEResidualBlock(nn.Module):
         return identity + x
 
 
+class EdgeConditionedGATv2Layer(nn.Module):
+    """
+    Edge-conditioned GATv2-style message-passing layer.
+
+    This is an edge-conditioned extension of the existing node-only
+    CustomGAT formulation.  Edge features influence both:
+      1. the attention score (which neighbour to focus on)
+      2. the transmitted message (what information flows)
+
+    The attention follows a GATv2-style formulation: source, destination,
+    and edge representations are combined *before* the nonlinearity,
+    allowing the score to depend jointly on the node pair and their edge.
+
+        u_ij = W_src h_i + W_dst h_j + W_e z_ij
+        s_ij = a^T LeakyReLU(u_ij, 0.2)
+        alpha_ij = softmax_j(s_ij)
+
+    The message also incorporates the edge:
+        m_ij = SiLU( V_src h_i + V_dst h_j + V_e z_ij )
+
+    Aggregate:   m_i = sum_j alpha_ij * m_ij
+    (Residual connection is handled by the wrapping EdgeGATResidualBlock.)
+
+    Self-loops are added (matching the supervisor's CustomGAT default of
+    add_self_loops=True).  Each self-loop receives a zero edge-feature
+    vector so the self-loop contributes no geometric bias.
+
+    Multi-head: each head operates on (hidden_dim // heads) dimensions
+    independently, then concatenates back to hidden_dim, matching the
+    output dimensionality of the supervisor's CustomGAT with concat=True.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        edge_hidden_dim: int = 128,
+        heads: int = 8,
+        dropout: float = 0.01,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+        self.head_dim = hidden_dim // heads
+        if hidden_dim % heads != 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} must be divisible by heads={heads}"
+            )
+
+        # ---------- attention path ----------
+        self.lin_src = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.lin_dst = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.lin_edge = nn.Linear(edge_hidden_dim, hidden_dim, bias=False)
+
+        self.attn = nn.Parameter(torch.empty(1, heads, self.head_dim))
+        nn.init.xavier_uniform_(self.attn)
+
+        # ---------- message path ----------
+        self.msg_src = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.msg_dst = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.msg_edge = nn.Linear(edge_hidden_dim, hidden_dim, bias=False)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr_encoded: torch.Tensor,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        x : [N, hidden_dim]  node representations
+        edge_index : [2, E]  directed edge list (raw, without self-loops)
+        edge_attr_encoded : [E, edge_hidden_dim]  already-encoded edge features
+        edge_dropout_p : probability of dropping a real edge during training.
+            Self-loop edges are never dropped.
+
+        Returns [N, hidden_dim] (no residual; the wrapping block adds it).
+        """
+        num_nodes = x.size(0)
+        E = edge_attr_encoded.size(0)
+
+        # -------- Edge dropout --------
+        if self.training and edge_dropout_p > 0.0 and E > 0:
+            keep = (torch.rand(E, device=edge_attr_encoded.device) >= edge_dropout_p)
+            if keep.sum().item() == 0:
+                keep[torch.randint(0, E, (1,), device=keep.device).item()] = True
+            edge_index        = edge_index[:, keep]
+            edge_attr_encoded = edge_attr_encoded[keep]
+
+        # -------- Self-loops (zero edge features) --------
+        self_loops = torch.arange(num_nodes, device=x.device).unsqueeze(0).repeat(2, 1)
+        self_loop_attr = torch.zeros(
+            (num_nodes, edge_attr_encoded.size(1)),
+            device=edge_attr_encoded.device,
+            dtype=edge_attr_encoded.dtype,
+        )
+        edge_index        = torch.cat([edge_index,        self_loops],     dim=1)  # [2, E'+N]
+        edge_attr_encoded = torch.cat([edge_attr_encoded, self_loop_attr], dim=0)  # [E'+N, D]
+
+        src = edge_index[0]
+        dst = edge_index[1]
+
+        # -------- Attention scores --------
+        # Project the N nodes once, then gather per edge (identical maths to
+        # projecting x[src] / x[dst], but E'+N rows cheaper).
+        # u_ij = W_src h_i + W_dst h_j + W_e z_ij
+        att_src = self.lin_src(x)
+        att_dst = self.lin_dst(x)
+        att_input = F.leaky_relu(
+            att_src[src] + att_dst[dst] + self.lin_edge(edge_attr_encoded),
+            negative_slope=0.2,
+        )
+        att_input = att_input.view(-1, self.heads, self.head_dim)  # [E'+N, H, D_h]
+
+        # Upcast to float32 for softmax stability (same as CustomGAT).
+        att_f = att_input.float()
+        scores = (att_f * self.attn).sum(dim=-1)                   # [E'+N, H]
+
+        # Numerically stable softmax with a PER-DESTINATION max.  A global max
+        # underflows exp() for nodes whose scores sit far below it, which then
+        # zeroes their messages.  Self-loops guarantee every node has >=1 edge.
+        with torch.no_grad():
+            s_max = torch.full(
+                (num_nodes, self.heads), float("-inf"),
+                device=x.device, dtype=torch.float32,
+            )
+            s_max.scatter_reduce_(
+                0, dst.unsqueeze(-1).expand_as(scores), scores,
+                reduce="amax", include_self=True,
+            )
+        scores    = torch.exp(scores - s_max[dst])
+        alpha_sum = torch.zeros((num_nodes, self.heads), device=x.device, dtype=torch.float32)
+        alpha_sum.index_add_(0, dst, scores)
+        alpha = scores / alpha_sum[dst].clamp(min=1e-6)            # [E'+N, H]
+        alpha = self.dropout(alpha)
+
+        # -------- Messages --------
+        # m_ij = SiLU( V_src h_i + V_dst h_j + V_e z_ij )
+        msg_src = self.msg_src(x)
+        msg_dst = self.msg_dst(x)
+        m = F.silu(msg_src[src] + msg_dst[dst] + self.msg_edge(edge_attr_encoded))
+        m = m.view(-1, self.heads, self.head_dim).float()          # [E'+N, H, D_h]
+        m = m * alpha.unsqueeze(-1)
+
+        # -------- Aggregation (single index_add_, no per-head loop) --------
+        out = torch.zeros(
+            (num_nodes, self.heads, self.head_dim),
+            device=x.device, dtype=torch.float32,
+        )
+        out.index_add_(0, dst, m)
+
+        return out.reshape(num_nodes, self.hidden_dim).to(x.dtype)
+
+
+class EdgeGATResidualBlock(nn.Module):
+    """
+    Residual wrapper around EdgeConditionedGATv2Layer.
+
+    Default (node_update=False) follows the exact same pattern as
+    GATResidualBlock, so edge conditioning is the only change vs gat_residual:
+        1. Optional projection if in_channels != hidden_dim
+        2. Apply the GATv2 layer
+        3. ReLU + dropout
+        4. Add residual
+
+    With node_update=True (ablation) the block instead mirrors EdgeMPNNLayer:
+        h <- LayerNorm(h + node_mlp([h, agg]))
+    which adds a node-update MLP and normalisation on top.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int,
+        edge_hidden_dim: int,
+        heads: int = 8,
+        dropout: float = 0.01,
+        node_update: bool = False,
+    ):
+        super().__init__()
+        self.project = (
+            nn.Linear(in_channels, hidden_dim)
+            if in_channels != hidden_dim
+            else None
+        )
+        self.gat = EdgeConditionedGATv2Layer(
+            hidden_dim=hidden_dim,
+            edge_hidden_dim=edge_hidden_dim,
+            heads=heads,
+            dropout=dropout,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.node_update = bool(node_update)
+        if self.node_update:
+            self.node_mlp = MLP(2 * hidden_dim, hidden_dim, hidden_dim=hidden_dim, n_layers=2, dropout=dropout)
+            self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr_encoded: torch.Tensor,
+        edge_dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        if self.project is not None:
+            x = self.project(x)
+        identity = x
+        agg = self.gat(x, edge_index, edge_attr_encoded, edge_dropout_p)
+        if self.node_update:
+            h_upd = self.node_mlp(torch.cat([identity, agg], dim=1))
+            return self.norm(identity + h_upd)
+        x = F.relu(agg)
+        x = self.dropout(x)
+        return identity + x
+
+
 class FourierEncoder(nn.Module):
     def __init__(self, xdim: int, base: float = 3.0, min_exp: int = -6, max_exp: int = 6):
         super().__init__()
@@ -1068,6 +1285,119 @@ class TrackGraphRegressorGNN(nn.Module):
             "eta": eta,
             "phi_raw": phi_raw,
         }
+
+
+# ---------------------------------------------------------------------------
+# Edge-conditioned GATv2 model  (append-only; supervisor's classes untouched)
+# ---------------------------------------------------------------------------
+
+class EdgeTrackGraphRegressorGNN(TrackGraphRegressorGNN):
+    """
+    Edge-conditioned GATv2-style variant of the supervisor's
+    TrackGraphRegressorGNN.
+
+    Inherits everything from TrackGraphRegressorGNN — the Fourier node
+    encoder, graph pooling, and all three regression heads — and overrides
+    only __init__ and forward to:
+
+      1. Build an edge encoder MLP  (edim → hdim → hdim) that maps the
+         7 raw edge features into the same 128-d space as the node encoder.
+
+      2. Replace the layer stack with EdgeGATResidualBlock layers that
+         condition both attention and messages on the encoded edge features.
+
+      3. Pass edge_dropout_p correctly to each layer.
+
+    The supervisor's four layer families (mpnn, edge_residual, sage_residual,
+    gat_residual) and their classes are not modified.  The new layer_type
+    value "edge_gat" routes construction here via the factory in main().
+    """
+
+    def __init__(
+        self,
+        xdim: int,
+        edim: int,
+        hdim: int = 128,
+        n_layers: int = 4,
+        dropout: float = 0.1,
+        gat_heads: int = 8,
+        use_fourier: bool = False,
+        fourier_base: float = 3.0,
+        fourier_min_exp: int = -6,
+        fourier_max_exp: int = 6,
+        graph_pool: str = "meanmax",
+        phi_mode: str = "sincos",
+        node_update: bool = False,
+    ):
+        # Call the parent with an existing layer type so the base __init__
+        # builds the Fourier encoder, node encoder, and regression heads.
+        # The temporary layer stack is immediately replaced below.
+        super().__init__(
+            xdim=xdim,
+            edim=edim,
+            hdim=hdim,
+            n_layers=n_layers,
+            dropout=dropout,
+            layer_type="mpnn",   # temporary; overwritten below
+            gat_heads=gat_heads,
+            use_fourier=use_fourier,
+            fourier_base=fourier_base,
+            fourier_min_exp=fourier_min_exp,
+            fourier_max_exp=fourier_max_exp,
+            graph_pool=graph_pool,
+            phi_mode=phi_mode,
+        )
+        # Record the real layer type so logging / checkpoints are correct.
+        self.layer_type = "edge_gat"
+
+        if gat_heads <= 0:
+            raise ValueError("gat_heads must be >= 1")
+        if hdim % gat_heads != 0:
+            raise ValueError(f"hidden_dim={hdim} must be divisible by gat_heads={gat_heads}")
+
+        # Edge encoder: 2-layer MLP  edim → hdim → hdim.
+        # Encodes the 7 raw edge features once into the same hidden space
+        # as the node encoder output.  The edge-GAT layers consume the
+        # encoded representation; the MPNN each layer gets raw edge_attr.
+        self.edge_enc = MLP(edim, hdim, hidden_dim=hdim, n_layers=2, dropout=dropout)
+
+        # Replace the GATResidualBlock stack with EdgeGATResidualBlock layers.
+        self.layers = nn.ModuleList([
+            EdgeGATResidualBlock(
+                in_channels=hdim,
+                hidden_dim=hdim,
+                edge_hidden_dim=hdim,
+                heads=gat_heads,
+                dropout=dropout,
+                node_update=node_update,
+            )
+            for _ in range(n_layers)
+        ])
+        # The parent GAT branch does not use edge_attr, so explicitly mark
+        # this new model as edge-aware.
+        self._uses_edge_attr = True
+
+    def forward(self, x, edge_index, edge_attr, edge_dropout_p: float = 0.0):
+        # ---- Node encoding (inherited Fourier + MLP) ----
+        if self.fourier is not None:
+            x = self.fourier(x)
+        h = self.node_enc(x)
+
+        # ---- Edge encoding (once, shared across all layers) ----
+        # The raw edge_attr [E, 7] is encoded to [E, hdim].  The encoded
+        # representation is static across layers; only node features update.
+        edge_attr_enc = self.edge_enc(edge_attr)
+
+        # ---- Edge-conditioned GATv2 message passing ----
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_attr_enc, edge_dropout_p)
+
+        # ---- Graph pooling + heads (fully inherited) ----
+        g = self._pool_graph(h)
+        pt      = self.head_pt(g).squeeze(0).squeeze(-1)
+        eta     = self.head_eta(g).squeeze(0).squeeze(-1)
+        phi_raw = self.head_phi(g).squeeze(0)
+        return {"pt": pt, "eta": eta, "phi_raw": phi_raw}
 
 
 # ----------------------------
@@ -1486,8 +1816,11 @@ def main():
     ap.add_argument("--max-train-graphs", type=int, default=-1)
     ap.add_argument("--batch-size", type=int, default=1, help="Number of graphs to combine into one optimizer step. Use 1 for one graph per batch.")
 
-    ap.add_argument("--layer-type", default="mpnn", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"])
+    ap.add_argument("--layer-type", default="mpnn", choices=["mpnn", "edge_residual", "sage_residual", "gat_residual", "edge_gat"],
+                    help="GNN layer family. edge_gat = edge-conditioned GATv2-style (EdgeTrackGraphRegressorGNN).")
     ap.add_argument("--gat-heads", type=int, default=4)
+    ap.add_argument("--edge-gat-node-update", action="store_true", default=False,
+                    help="edge_gat only: add node-update MLP + LayerNorm (MPNN-style) instead of plain GAT residual.")
     ap.add_argument("--sage-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--edgeconv-aggr", default="mean", choices=["mean", "sum", "max"])
     ap.add_argument("--graph-pool", default="meanmax", choices=["mean", "max", "meanmax"])
@@ -1700,23 +2033,42 @@ def main():
     if ddp_is_main():
         print(f"[i] xdim={xdim} edim={edim} ydim={ydim}")
 
-    model = TrackGraphRegressorGNN(
-        xdim=xdim,
-        edim=edim,
-        hdim=args.hidden_dim,
-        n_layers=args.layers,
-        dropout=args.dropout,
-        layer_type=args.layer_type,
-        gat_heads=args.gat_heads,
-        sage_aggr=args.sage_aggr,
-        edgeconv_aggr=args.edgeconv_aggr,
-        use_fourier=args.fourier,
-        fourier_base=args.fourier_base,
-        fourier_min_exp=args.fourier_min_exp,
-        fourier_max_exp=args.fourier_max_exp,
-        graph_pool=args.graph_pool,
-        phi_mode=args.phi_mode,
-    ).to(device)
+    if args.layer_type == "edge_gat":
+        # Route to the edge-conditioned GATv2 subclass.  All other arguments
+        # (data loading, optimiser, EMA, etc.) remain identical.
+        model = EdgeTrackGraphRegressorGNN(
+            xdim=xdim,
+            edim=edim,
+            hdim=args.hidden_dim,
+            n_layers=args.layers,
+            dropout=args.dropout,
+            gat_heads=args.gat_heads,
+            use_fourier=args.fourier,
+            fourier_base=args.fourier_base,
+            fourier_min_exp=args.fourier_min_exp,
+            fourier_max_exp=args.fourier_max_exp,
+            graph_pool=args.graph_pool,
+            phi_mode=args.phi_mode,
+            node_update=args.edge_gat_node_update,
+        ).to(device)
+    else:
+        model = TrackGraphRegressorGNN(
+            xdim=xdim,
+            edim=edim,
+            hdim=args.hidden_dim,
+            n_layers=args.layers,
+            dropout=args.dropout,
+            layer_type=args.layer_type,
+            gat_heads=args.gat_heads,
+            sage_aggr=args.sage_aggr,
+            edgeconv_aggr=args.edgeconv_aggr,
+            use_fourier=args.fourier,
+            fourier_base=args.fourier_base,
+            fourier_min_exp=args.fourier_min_exp,
+            fourier_max_exp=args.fourier_max_exp,
+            graph_pool=args.graph_pool,
+            phi_mode=args.phi_mode,
+        ).to(device)
 
     if ddp_is_initialized():
         model = torch.nn.parallel.DistributedDataParallel(
@@ -2203,6 +2555,7 @@ def main():
                     "dropout": args.dropout,
                     "layer_type": args.layer_type,
                     "gat_heads": args.gat_heads,
+                    "edge_gat_node_update": args.edge_gat_node_update,
                     "sage_aggr": args.sage_aggr,
                     "edgeconv_aggr": args.edgeconv_aggr,
                     "graph_pool": args.graph_pool,

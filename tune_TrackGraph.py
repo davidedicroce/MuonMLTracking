@@ -783,6 +783,7 @@ def read_ckpt_metrics(ckpt_path: Path) -> Dict[str, Any]:
     for k in [
         "best_monitor", "early_stop_monitor", "best_ckpt_epoch", "run_id",
         "hidden_dim", "layers", "dropout", "layer_type", "gat_heads",
+        "edge_gat_node_update",
         "sage_aggr", "edgeconv_aggr", "graph_pool", "loss_type",
         "fourier", "fourier_base", "fourier_min_exp", "fourier_max_exp",
         "target_scale_mode", "target_scale_eps", "phi_mode", "phi_period",
@@ -854,8 +855,9 @@ def normalize_hparams(hp: Dict[str, Any]) -> Dict[str, Any]:
     hp.setdefault("phi_mode", "sincos")
     hp.setdefault("phi_vec_weight", 1.0)
     hp.setdefault("target_loss_weights", "1.0,1.0,1.0")
+    hp.setdefault("edge_gat_node_update", False)
 
-    if hp["layer_type"] == "gat_residual":
+    if hp["layer_type"] in ("gat_residual", "edge_gat"):
         hidden_dim = int(hp.get("hidden_dim", 192))
         valid_heads = [h for h in [1, 2, 4, 8] if hidden_dim % h == 0]
         if not valid_heads:
@@ -912,10 +914,10 @@ def sample_hparams(trial: optuna.Trial, args) -> Dict[str, Any]:
     else:
         hp["layer_type"] = trial.suggest_categorical(
             "layer_type",
-            ["mpnn", "edge_residual", "sage_residual", "gat_residual"],
+            ["mpnn", "edge_residual", "sage_residual", "gat_residual", "edge_gat"],
         )
 
-    if hp["layer_type"] == "gat_residual":
+    if hp["layer_type"] in ("gat_residual", "edge_gat"):
         valid_heads = [h for h in [1, 2, 4, 8] if int(hp["hidden_dim"]) % h == 0]
         if not valid_heads:
             raise optuna.TrialPruned()
@@ -949,6 +951,8 @@ def sample_hparams(trial: optuna.Trial, args) -> Dict[str, Any]:
         hp["fourier_base"] = args.fourier_base
         hp["fourier_min_exp"] = args.fourier_min_exp
         hp["fourier_max_exp"] = args.fourier_max_exp
+
+    hp["edge_gat_node_update"] = bool(getattr(args, "edge_gat_node_update", False)) and hp["layer_type"] == "edge_gat"
 
     return normalize_hparams(hp)
 
@@ -1078,6 +1082,8 @@ def build_command(
     cmd += ["--gat-heads", str(int(hp.get("gat_heads", 4)))]
     cmd += ["--sage-aggr", str(hp.get("sage_aggr", "mean"))]
     cmd += ["--edgeconv-aggr", str(hp.get("edgeconv_aggr", "mean"))]
+    if bool(hp.get("edge_gat_node_update", False)):
+        cmd.append("--edge-gat-node-update")
 
     # Fourier knobs
     if bool(hp["fourier"]):
@@ -1441,6 +1447,8 @@ def refit_topk(
         hp = dict(hp_src) if isinstance(hp_src, dict) and hp_src else dict(t.params)
         if args.fixed_layer_type is not None:
             hp["layer_type"] = args.fixed_layer_type
+        if getattr(args, "edge_gat_node_update", False):
+            hp["edge_gat_node_update"] = True
         hp["_trial_idx"] = t.number
         hp = normalize_hparams(hp)
 
@@ -1651,7 +1659,7 @@ def enqueue_retry_trials(
     return enqueued
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-script", type=Path, required=True)
     ap.add_argument("--data-glob", required=True)
@@ -1677,8 +1685,11 @@ def main() -> None:
 
     # Restrict architecture family if desired
     ap.add_argument("--fixed-layer-type", default=None,
-        choices=["mpnn", "edge_residual", "sage_residual", "gat_residual"],
+        choices=["mpnn", "edge_residual", "sage_residual", "gat_residual", "edge_gat"],
         help="If set, restrict this Optuna study to one layer_type.",
+    )
+    ap.add_argument("--edge-gat-node-update", action="store_true", default=False,
+        help="edge_gat only: pass --edge-gat-node-update to train_TrackGraph.py.",
     )
 
     # Dataloader/trainer controls
@@ -1824,6 +1835,11 @@ def main() -> None:
                     help="Keep the study running when a trial raises RuntimeError/OSError.")
     ap.add_argument("--stop-on-trial-error", dest="continue_on_trial_error", action="store_false")
 
+    return ap
+
+
+def main() -> None:
+    ap = build_parser()
     args = ap.parse_args()
 
     args.jsonl_session_id_user_supplied = args.jsonl_session_id is not None
