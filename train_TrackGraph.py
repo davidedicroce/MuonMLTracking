@@ -914,7 +914,7 @@ class EdgeConditionedGATv2Layer(nn.Module):
       2. the transmitted message (what information flows)
 
     The attention follows a GATv2-style formulation: source, destination,
-    and edge representations are combined *before* the nonlinearity,
+    and edge representations are combined before the nonlinearity,
     allowing the score to depend jointly on the node pair and their edge.
 
         u_ij = W_src h_i + W_dst h_j + W_e z_ij
@@ -922,18 +922,17 @@ class EdgeConditionedGATv2Layer(nn.Module):
         alpha_ij = softmax_j(s_ij)
 
     The message also incorporates the edge:
-        m_ij = SiLU( V_src h_i + V_dst h_j + V_e z_ij )
+        m_ij = SiLU(V_src h_i + V_dst h_j + V_e z_ij)
+
 
     Aggregate:   m_i = sum_j alpha_ij * m_ij
     (Residual connection is handled by the wrapping EdgeGATResidualBlock.)
 
-    Self-loops are added (matching the supervisor's CustomGAT default of
-    add_self_loops=True).  Each self-loop receives a zero edge-feature
+    Self-loops are added.  Each self-loop receives a zero edge-feature
     vector so the self-loop contributes no geometric bias.
 
     Multi-head: each head operates on (hidden_dim // heads) dimensions
-    independently, then concatenates back to hidden_dim, matching the
-    output dimensionality of the supervisor's CustomGAT with concat=True.
+    independently, then concatenates back to hidden_dim
     """
 
     def __init__(
@@ -981,7 +980,7 @@ class EdgeConditionedGATv2Layer(nn.Module):
         edge_dropout_p : probability of dropping a real edge during training.
             Self-loop edges are never dropped.
 
-        Returns [N, hidden_dim] (no residual; the wrapping block adds it).
+        Returns [N, hidden_dim] (no residual the wrapping block adds it).
         """
         num_nodes = x.size(0)
         E = edge_attr_encoded.size(0)
@@ -1008,8 +1007,6 @@ class EdgeConditionedGATv2Layer(nn.Module):
         dst = edge_index[1]
 
         # -------- Attention scores --------
-        # Project the N nodes once, then gather per edge (identical maths to
-        # projecting x[src] / x[dst], but E'+N rows cheaper).
         # u_ij = W_src h_i + W_dst h_j + W_e z_ij
         att_src = self.lin_src(x)
         att_dst = self.lin_dst(x)
@@ -1019,13 +1016,12 @@ class EdgeConditionedGATv2Layer(nn.Module):
         )
         att_input = att_input.view(-1, self.heads, self.head_dim)  # [E'+N, H, D_h]
 
-        # Upcast to float32 for softmax stability (same as CustomGAT).
+
         att_f = att_input.float()
         scores = (att_f * self.attn).sum(dim=-1)                   # [E'+N, H]
 
-        # Numerically stable softmax with a PER-DESTINATION max.  A global max
-        # underflows exp() for nodes whose scores sit far below it, which then
-        # zeroes their messages.  Self-loops guarantee every node has >=1 edge.
+        # Subtract the max score for each destination to keep softmax numerically stable
+        # Those self-loops ensure every node has at least one incoming edge.
         with torch.no_grad():
             s_max = torch.full(
                 (num_nodes, self.heads), float("-inf"),
@@ -1049,7 +1045,7 @@ class EdgeConditionedGATv2Layer(nn.Module):
         m = m.view(-1, self.heads, self.head_dim).float()          # [E'+N, H, D_h]
         m = m * alpha.unsqueeze(-1)
 
-        # -------- Aggregation (single index_add_, no per-head loop) --------
+        # -------- Aggregation --------
         out = torch.zeros(
             (num_nodes, self.heads, self.head_dim),
             device=x.device, dtype=torch.float32,
@@ -1061,18 +1057,21 @@ class EdgeConditionedGATv2Layer(nn.Module):
 
 class EdgeGATResidualBlock(nn.Module):
     """
-    Residual wrapper around EdgeConditionedGATv2Layer.
+        Residual block built around EdgeConditionedGATv2Layer.
 
-    Default (node_update=False) follows the exact same pattern as
-    GATResidualBlock, so edge conditioning is the only change vs gat_residual:
-        1. Optional projection if in_channels != hidden_dim
-        2. Apply the GATv2 layer
-        3. ReLU + dropout
-        4. Add residual
+        By default, (node_update=False), it follows the same structure as
+        GATResidualBlock, with edge conditioning being the main difference:
+            1. Project the input if its dimensions don't match hidden_dim
+            2. Apply the GATv2 layer
+            3. Apply ReLU and dropout
+            4. Add the residual connection
 
-    With node_update=True (ablation) the block instead mirrors EdgeMPNNLayer:
-        h <- LayerNorm(h + node_mlp([h, agg]))
-    which adds a node-update MLP and normalisation on top.
+        With node_update=True (ablation), it uses a different approach, similar
+        to EdgeMPNNLayer:
+            h <- LayerNorm(h + node_mlp([h, agg]))
+
+        This adds a node-update MLP and LayerNorm to the block, allowing us
+        to test whether these extra components improve performance.
     """
 
     def __init__(
@@ -1288,29 +1287,27 @@ class TrackGraphRegressorGNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Edge-conditioned GATv2 model  (append-only; supervisor's classes untouched)
+# Edge-conditioned GATv2 model
 # ---------------------------------------------------------------------------
 
 class EdgeTrackGraphRegressorGNN(TrackGraphRegressorGNN):
     """
-    Edge-conditioned GATv2-style variant of the supervisor's
-    TrackGraphRegressorGNN.
+    Edge-conditioned GATv2 variant of TrackGraphRegressorGNN.
 
-    Inherits everything from TrackGraphRegressorGNN — the Fourier node
-    encoder, graph pooling, and all three regression heads — and overrides
-    only __init__ and forward to:
+    Keeps the existing Fourier node encoder, graph pooling, and three
+    regression heads, while changing the initialization and forward pass to:
 
-      1. Build an edge encoder MLP  (edim → hdim → hdim) that maps the
-         7 raw edge features into the same 128-d space as the node encoder.
+        1. Add an edge encoder MLP (edim -> hdim -> hdim) to map the 7 raw
+        edge features into the same 128-dimensional space as node features.
 
-      2. Replace the layer stack with EdgeGATResidualBlock layers that
-         condition both attention and messages on the encoded edge features.
+        2. Use EdgeGATResidualBlock layers that incorporate edge features
+        into both attention and message passing.
 
-      3. Pass edge_dropout_p correctly to each layer.
+        3. Pass edge_dropout_p to each layer.
 
-    The supervisor's four layer families (mpnn, edge_residual, sage_residual,
-    gat_residual) and their classes are not modified.  The new layer_type
-    value "edge_gat" routes construction here via the factory in main().
+    The existing layer types (mpnn, edge_residual, sage_residual, and
+    gat_residual) remain unchanged. The new "edge_gat" layer type is
+    handled by the model factory in main().
     """
 
     def __init__(
@@ -1329,9 +1326,8 @@ class EdgeTrackGraphRegressorGNN(TrackGraphRegressorGNN):
         phi_mode: str = "sincos",
         node_update: bool = False,
     ):
-        # Call the parent with an existing layer type so the base __init__
-        # builds the Fourier encoder, node encoder, and regression heads.
-        # The temporary layer stack is immediately replaced below.
+        # Initialize the shared components, including the Fourier encoder,node encoder, and regression heads.
+        # The layer stack created here is replaced with the new one below.
         super().__init__(
             xdim=xdim,
             edim=edim,
@@ -1355,10 +1351,7 @@ class EdgeTrackGraphRegressorGNN(TrackGraphRegressorGNN):
         if hdim % gat_heads != 0:
             raise ValueError(f"hidden_dim={hdim} must be divisible by gat_heads={gat_heads}")
 
-        # Edge encoder: 2-layer MLP  edim → hdim → hdim.
-        # Encodes the 7 raw edge features once into the same hidden space
-        # as the node encoder output.  The edge-GAT layers consume the
-        # encoded representation; the MPNN each layer gets raw edge_attr.
+        
         self.edge_enc = MLP(edim, hdim, hidden_dim=hdim, n_layers=2, dropout=dropout)
 
         # Replace the GATResidualBlock stack with EdgeGATResidualBlock layers.
@@ -1373,8 +1366,7 @@ class EdgeTrackGraphRegressorGNN(TrackGraphRegressorGNN):
             )
             for _ in range(n_layers)
         ])
-        # The parent GAT branch does not use edge_attr, so explicitly mark
-        # this new model as edge-aware.
+        # The parent GAT branch does not use edge_attr, so explicitly mark this new model as edge-aware.
         self._uses_edge_attr = True
 
     def forward(self, x, edge_index, edge_attr, edge_dropout_p: float = 0.0):
@@ -1384,8 +1376,8 @@ class EdgeTrackGraphRegressorGNN(TrackGraphRegressorGNN):
         h = self.node_enc(x)
 
         # ---- Edge encoding (once, shared across all layers) ----
-        # The raw edge_attr [E, 7] is encoded to [E, hdim].  The encoded
-        # representation is static across layers; only node features update.
+        # The raw edge_attr [E, 7] is encoded to [E, hdim] 
+        # The encoded representation is static across layers only node features update
         edge_attr_enc = self.edge_enc(edge_attr)
 
         # ---- Edge-conditioned GATv2 message passing ----
@@ -2034,8 +2026,7 @@ def main():
         print(f"[i] xdim={xdim} edim={edim} ydim={ydim}")
 
     if args.layer_type == "edge_gat":
-        # Route to the edge-conditioned GATv2 subclass.  All other arguments
-        # (data loading, optimiser, EMA, etc.) remain identical.
+        # Route to the edge-conditioned GATv2 subclass.  
         model = EdgeTrackGraphRegressorGNN(
             xdim=xdim,
             edim=edim,
